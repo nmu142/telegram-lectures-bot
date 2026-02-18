@@ -336,6 +336,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "list_admins",
         "stats",
         "admin_cancel",
+        "admin_panel",
     }
 
     # Admin-specific callbacks (by prefix)
@@ -452,8 +453,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
    # =======================
 # ADMIN PANEL
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+async def send_admin_panel(message, uid: int):
+    if not is_admin(uid):
         return
 
     keyboard = [
@@ -478,13 +479,17 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         [InlineKeyboardButton("👑 إدارة المشرفين", callback_data="admins")],
 
-        [InlineKeyboardButton("🏠 الرئيسية", callback_data="home")],
+        [InlineKeyboardButton("🏠 رجوع للأدمن", callback_data="admin_panel")],
     ]
 
-    await update.message.reply_text(
+    await message.reply_text(
         "👑 لوحة تحكم الأدمن:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_admin_panel(update.message, update.effective_user.id)
 
 
 # =======================
@@ -497,6 +502,12 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id
 
     if not is_admin(uid):
+        return
+
+    # =======================
+    # RETURN TO ADMIN PANEL
+    if query.data == "admin_panel":
+        await send_admin_panel(query.message, uid)
         return
 
     # =======================

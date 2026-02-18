@@ -1222,8 +1222,12 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # Daily automatic backup at 00:00
-    app.job_queue.run_daily(auto_backup, time=dtime(hour=0, minute=0, second=0))
+    # Daily automatic backup at 00:00 (only if JobQueue is available)
+    if app.job_queue is not None:
+        app.job_queue.run_daily(auto_backup, time=dtime(hour=0, minute=0, second=0))
+    else:
+        print("⚠️ Auto backup disabled because JobQueue is not available. "
+              "Install python-telegram-bot[job-queue] to enable it.")
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))

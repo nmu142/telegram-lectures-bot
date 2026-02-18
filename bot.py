@@ -308,6 +308,60 @@ async def reports_menu(query):
 
 
 # =======================
+# CALLBACK ROUTER (dispatch student/admin buttons)
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = (query.data or "").strip()
+
+    # Admin-specific callbacks (by exact value)
+    admin_exact = {
+        "add_subject",
+        "add_lecture",
+        "delete_subject",
+        "delete_lecture",
+        "edit_subject",
+        "edit_lecture",
+        "manage_links",
+        "add_link",
+        "delete_link",
+        "edit_link",
+        "order_links",
+        "backup",
+        "bot_off",
+        "bot_on",
+        "broadcast",
+        "admins",
+        "add_admin_btn",
+        "remove_admin_btn",
+        "list_admins",
+        "stats",
+        "admin_cancel",
+    }
+
+    # Admin-specific callbacks (by prefix)
+    admin_prefixes = (
+        "chooseSub_",
+        "confirmDelSub_",
+        "doDelSub_",
+        "delLecSub_",
+        "confirmDelLec_",
+        "doDelLec_",
+        "editSub_",
+        "editLec_",
+        "confirmDelLink_",
+        "doDelLink_",
+        "editLink_",
+        "linkUp_",
+        "linkDown_",
+    )
+
+    if data in admin_exact or any(data.startswith(p) for p in admin_prefixes):
+        await admin_buttons(update, context)
+    else:
+        await button_handler(update, context)
+
+
+# =======================
 # BUTTON HANDLER (Student Part)
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1235,8 +1289,8 @@ def main():
     app.add_handler(CommandHandler("addadmin", add_admin))
     app.add_handler(CommandHandler("removeadmin", remove_admin))
 
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CallbackQueryHandler(admin_buttons))
+    # Single router for all callback queries to avoid handler conflicts
+    app.add_handler(CallbackQueryHandler(callback_router))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))

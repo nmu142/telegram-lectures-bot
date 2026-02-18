@@ -31,6 +31,14 @@ MAINTENANCE_MESSAGE = (
 )
 
 # Rate Limit
+RATE_LIMIT_WINDOW = 10          # عدد الثواني لحساب الرسائل
+RATE_LIMIT_MAX_MESSAGES = 5     # الحد الأقصى للرسائل داخل الـ WINDOW
+RATE_LIMIT_BLOCK_SECONDS = 10   # مدة الحظر بالثواني
+RATE_LIMIT_MESSAGE = (
+    "🚫 برجاء الانتظار 10 ثواني قبل إرسال رسائل جديدة "
+    "حتى لا يتعطل البوت."
+)
+
 user_messages = {}
 blocked_users = {}
 
@@ -139,19 +147,20 @@ async def check_rate_limit(update: Update):
 
     if uid in blocked_users:
         if now < blocked_users[uid]:
-            await update.message.reply_text("🚫 استنى 10 ثواني قبل ما تبعت تاني.")
+            await update.message.reply_text(RATE_LIMIT_MESSAGE)
             return False
         else:
             del blocked_users[uid]
 
     msgs = user_messages.get(uid, [])
-    msgs = [t for t in msgs if now - t < 10]
+    msgs = [t for t in msgs if now - t < RATE_LIMIT_WINDOW]
     msgs.append(now)
     user_messages[uid] = msgs
 
-    if len(msgs) >= 5:
-        blocked_users[uid] = now + 10
-        await update.message.reply_text("🚫 استنى 10 ثواني قبل ما تبعت تاني.")
+    # لو بعت أكتر من الحد المسموح في الفترة المحددة
+    if len(msgs) > RATE_LIMIT_MAX_MESSAGES:
+        blocked_users[uid] = now + RATE_LIMIT_BLOCK_SECONDS
+        await update.message.reply_text(RATE_LIMIT_MESSAGE)
         return False
 
     return True
@@ -1184,6 +1193,10 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Maintenance check for students
     if not BOT_ENABLED and not is_admin(uid):
         await update.message.reply_text(MAINTENANCE_MESSAGE)
+        return
+
+    # Rate limit (نفس الميكانيزم بتاع الرسائل النصية)
+    if not await check_rate_limit(update):
         return
 
     # Student sending PDF for missing files (optional attachment)

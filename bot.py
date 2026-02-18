@@ -18,10 +18,8 @@ TOKEN = os.getenv("TOKEN")
 
 MAIN_ADMIN_ID = 8377544927
 ADMIN_USERNAME = "El8awy116"
-
 DB_FILE = "lectures.db"
 
-# Maintenance Mode Global
 BOT_ENABLED = True
 
 # Rate Limit
@@ -71,7 +69,6 @@ def init_db():
     )
     """)
 
-    # Important Links Table
     c.execute("""
     CREATE TABLE IF NOT EXISTS important_links (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,7 +102,7 @@ def is_admin(uid):
 
 
 # =======================
-# USER REGISTER
+# REGISTER USER
 async def register_user(update: Update):
     uid = update.effective_user.id
     conn = db()
@@ -116,7 +113,7 @@ async def register_user(update: Update):
 
 
 # =======================
-# RATE LIMIT
+# RATE LIMIT CHECK
 async def check_rate_limit(update: Update):
     uid = update.effective_user.id
     now = time.time()
@@ -179,8 +176,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "أتمنالك تجربة ممتعة وموفقة بإذن الله ❤️📚",
         reply_markup=main_menu()
     )
-
-
 # =======================
 # SHOW SUBJECTS
 async def show_subjects(message):
@@ -227,11 +222,11 @@ async def show_lectures(query, subject_id):
 
 
 # =======================
-# IMPORTANT LINKS (Student)
+# IMPORTANT LINKS
 async def show_links(query):
     conn = db()
     c = conn.cursor()
-    c.execute("SELECT id,title FROM important_links ORDER BY position ASC")
+    c.execute("SELECT id,title,url FROM important_links ORDER BY position ASC")
     links = c.fetchall()
     conn.close()
 
@@ -240,7 +235,7 @@ async def show_links(query):
         return
 
     keyboard = []
-    for lid, title in links:
+    for lid, title, url in links:
         keyboard.append([InlineKeyboardButton(f"🔗 {title}", callback_data=f"openLink_{lid}")])
 
     keyboard.append([InlineKeyboardButton("🏠 رجوع", callback_data="home")])
@@ -260,21 +255,13 @@ async def reports_menu(query):
 
 
 # =======================
-# BUTTON HANDLER (Student Part)
+# BUTTON HANDLER (Students + Admin Redirect)
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid = query.from_user.id
 
-    # Maintenance check
-    if not BOT_ENABLED and not is_admin(uid):
-        await query.message.reply_text(
-            "💡 عزيزي الطالب ❤️\n"
-            "البوت تحت التحديث حاليًا علشان نقدملك حاجة تليق بيك\n"
-            "ارجع قريبًا إن شاء الله ✨"
-        )
-        return
-
+    # =======================
     # HOME
     if query.data == "home":
         await query.message.reply_text("اختر الخدمة المطلوبة:", reply_markup=main_menu())
@@ -308,16 +295,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reports_menu(query)
         return
 
-    # REPORT PROBLEM
     if query.data == "report_problem":
         context.user_data["reporting"] = True
-        await query.message.reply_text("✍️ اكتب المشكلة وسيتم إرسالها للإدارة:", reply_markup=home_button())
+        await query.message.reply_text("✍️ اكتب المشكلة وسيتم إرسالها للإدارة:")
         return
 
-    # MISSING FILES
     if query.data == "missing_files":
         context.user_data["missing_step"] = "subject"
-        await query.message.reply_text("📚 اكتب اسم المادة:", reply_markup=home_button())
+        await query.message.reply_text("📚 اكتب اسم المادة:")
         return
 
     # OPEN SUBJECT
@@ -327,7 +312,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_lectures(query, sid)
         return
 
-    # OPEN LECTURE
+    # OPEN LECTURE PDF
     if query.data.startswith("lec_"):
         lec_id = int(query.data.replace("lec_", ""))
 
@@ -352,7 +337,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("اختر التالي 👇", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-   # =======================
+    # =======================
+    # ADMIN BUTTONS REDIRECT
+    if is_admin(uid):
+        await admin_buttons(update, context)
+        return
+# =======================
 # ADMIN PANEL
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -371,8 +361,6 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔗 إدارة اللينكات المهمة", callback_data="manage_links")],
 
         [InlineKeyboardButton("📢 رسالة جماعية", callback_data="broadcast")],
-        [InlineKeyboardButton("👥 إدارة الأدمن", callback_data="admins")],
-
         [InlineKeyboardButton("📊 إحصائيات", callback_data="stats")],
 
         [InlineKeyboardButton("📦 Backup Database", callback_data="backup")],
@@ -387,8 +375,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =======================
-# ADMIN BUTTONS (Continue inside button_handler)
-
+# ADMIN BUTTONS
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ENABLED
 
@@ -428,7 +415,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # =======================
-    # DELETE SUBJECT (Confirm)
+    # DELETE SUBJECT
     if query.data == "delete_subject":
         conn = db()
         c = conn.cursor()
@@ -440,7 +427,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for sid, name in subs:
             keyboard.append([InlineKeyboardButton(name, callback_data=f"confirmDelSub_{sid}")])
 
-        await query.message.reply_text("اختر المادة للحذف:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text("🗑 اختر المادة للحذف:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if query.data.startswith("confirmDelSub_"):
@@ -450,7 +437,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ تأكيد الحذف", callback_data=f"doDelSub_{sid}")],
             [InlineKeyboardButton("❌ إلغاء", callback_data="admin_cancel")]
         ]
-        await query.message.reply_text("⚠️ هل أنت متأكد؟", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text("⚠️ هل أنت متأكد من حذف المادة؟", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if query.data.startswith("doDelSub_"):
@@ -463,12 +450,12 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
 
-        log_admin_action(uid, f"🗑 Deleted Subject ID {sid}")
+        log_admin_action(uid, f"🗑 Deleted Subject {sid}")
         await query.message.reply_text("✅ تم حذف المادة ومحاضراتها.")
         return
 
     # =======================
-    # DELETE LECTURE (Subject → Lecture → Confirm)
+    # DELETE LECTURE
     if query.data == "delete_lecture":
         conn = db()
         c = conn.cursor()
@@ -480,7 +467,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for sid, name in subs:
             keyboard.append([InlineKeyboardButton(name, callback_data=f"delLecSub_{sid}")])
 
-        await query.message.reply_text("اختر المادة:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text("📚 اختر المادة:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if query.data.startswith("delLecSub_"):
@@ -496,7 +483,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for lid, title in lecs:
             keyboard.append([InlineKeyboardButton(title, callback_data=f"confirmDelLec_{lid}")])
 
-        await query.message.reply_text("اختر المحاضرة للحذف:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text("🗑 اختر المحاضرة للحذف:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if query.data.startswith("confirmDelLec_"):
@@ -518,116 +505,16 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
 
-        log_admin_action(uid, f"🗑 Deleted Lecture ID {lid}")
+        log_admin_action(uid, f"🗑 Deleted Lecture {lid}")
         await query.message.reply_text("✅ تم حذف المحاضرة.")
         return
 
     # =======================
-    # EDIT SUBJECT
-    if query.data == "edit_subject":
-        conn = db()
-        c = conn.cursor()
-        c.execute("SELECT id,name FROM subjects")
-        subs = c.fetchall()
-        conn.close()
-
-        keyboard = []
-        for sid, name in subs:
-            keyboard.append([InlineKeyboardButton(name, callback_data=f"editSub_{sid}")])
-
-        await query.message.reply_text("اختر المادة للتعديل:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if query.data.startswith("editSub_"):
-        sid = int(query.data.replace("editSub_", ""))
-        context.user_data["edit_subject_id"] = sid
-        await query.message.reply_text("✍️ اكتب الاسم الجديد:")
-        return
-
-    # =======================
-    # EDIT LECTURE
-    if query.data == "edit_lecture":
-        conn = db()
-        c = conn.cursor()
-        c.execute("SELECT id,title FROM lectures")
-        lecs = c.fetchall()
-        conn.close()
-
-        keyboard = []
-        for lid, title in lecs:
-            keyboard.append([InlineKeyboardButton(title, callback_data=f"editLec_{lid}")])
-
-        await query.message.reply_text("اختر المحاضرة للتعديل:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if query.data.startswith("editLec_"):
-        lid = int(query.data.replace("editLec_", ""))
-        context.user_data["edit_lecture_id"] = lid
-        await query.message.reply_text("✍️ اكتب العنوان الجديد:")
-        return
-
-    # =======================
-    # MANAGE LINKS
-    if query.data == "manage_links":
-        keyboard = [
-            [InlineKeyboardButton("➕ إضافة لينك", callback_data="add_link")],
-            [InlineKeyboardButton("🗑 حذف لينك", callback_data="delete_link")],
-            [InlineKeyboardButton("✏️ تعديل لينك", callback_data="edit_link")],
-            [InlineKeyboardButton("🔃 ترتيب اللينكات", callback_data="order_links")],
-            [InlineKeyboardButton("🏠 رجوع", callback_data="home")]
-        ]
-        await query.message.reply_text("🔗 إدارة اللينكات:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if query.data == "add_link":
-        context.user_data["add_link_step"] = "title"
-        await query.message.reply_text("✍️ اكتب اسم اللينك:")
-        return
-
-    # =======================
-    # BACKUP
-    if query.data == "backup":
-        await query.message.reply_document(open(DB_FILE, "rb"))
-        await query.message.reply_document(open("admin_log.txt", "rb"))
-        await query.message.reply_text("✅ Backup تم إرساله.")
-        return
-
-    # =======================
-    # BOT ON/OFF
-    if query.data == "bot_off":
-        BOT_ENABLED = False
-        await query.message.reply_text("⏸ تم إيقاف البوت للطلاب.")
-        return
-
-    if query.data == "bot_on":
-        BOT_ENABLED = True
-        await query.message.reply_text("▶️ تم تشغيل البوت للطلاب.")
-        return
-
-    # =======================
-    # BROADCAST
-    if query.data == "broadcast":
-        context.user_data["broadcast"] = True
-        await query.message.reply_text("✍️ اكتب الرسالة لإرسالها لكل الطلاب:")
-        return
-
-    # =======================
-    # ADMINS INFO
-    if query.data == "admins":
-        await query.message.reply_text(
-            "👥 إدارة الأدمن:\n\n"
-            "➕ إضافة أدمن:\n/addadmin ID\n\n"
-            "➖ حذف أدمن:\n/removeadmin ID"
-        )
-        return
-
-    # =======================
+    # CANCEL
     if query.data == "admin_cancel":
         context.user_data.clear()
         await query.message.reply_text("❌ تم الإلغاء.")
         return
-
-
 # =======================
 # HANDLE TEXT
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -637,13 +524,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
 
-    # REPORTING
+    # =======================
+    # REPORT PROBLEM
     if context.user_data.get("reporting"):
         for admin in get_all_admins():
             await context.bot.send_message(admin, f"🚨 مشكلة من طالب:\n\n{text}")
         context.user_data.clear()
+        await update.message.reply_text("✅ تم إرسال المشكلة للإدارة.")
         return
 
+    # =======================
     # MISSING FILES
     if context.user_data.get("missing_step") == "subject":
         context.user_data["missing_subject"] = text
@@ -653,58 +543,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("missing_step") == "lecture":
         context.user_data["missing_lecture"] = text
-        context.user_data["missing_step"] = "upload"
-        await update.message.reply_text("📤 لو معاك الملف ارفعه الآن (اختياري) أو اكتب (تخطي)")
-        return
-
-    if context.user_data.get("missing_step") == "upload":
-        subject = context.user_data["missing_subject"]
-        lecture = context.user_data["missing_lecture"]
+        context.user_data.clear()
 
         for admin in get_all_admins():
             await context.bot.send_message(
                 admin,
-                f"📌 نقص ملفات:\n\n📚 المادة: {subject}\n📄 المحاضرة: {lecture}"
+                f"📌 نقص ملفات:\n\n📚 المادة: {context.user_data.get('missing_subject')}\n📄 المحاضرة: {text}"
             )
 
-        context.user_data.clear()
-        await update.message.reply_text("✅ تم إرسال الطلب للإدارة.")
+        await update.message.reply_text("✅ تم إرسال طلب النقص للإدارة.")
         return
 
+    # =======================
     # ADMIN ONLY
     if not is_admin(uid):
         return
 
-    # EDIT SUBJECT NAME
-    if context.user_data.get("edit_subject_id"):
-        sid = context.user_data["edit_subject_id"]
-
-        conn = db()
-        c = conn.cursor()
-        c.execute("UPDATE subjects SET name=? WHERE id=?", (text, sid))
-        conn.commit()
-        conn.close()
-
-        log_admin_action(uid, f"✏️ Edited Subject {sid} -> {text}")
-        context.user_data.clear()
-        await update.message.reply_text("✅ تم تعديل اسم المادة.")
-        return
-
-    # EDIT LECTURE TITLE
-    if context.user_data.get("edit_lecture_id"):
-        lid = context.user_data["edit_lecture_id"]
-
-        conn = db()
-        c = conn.cursor()
-        c.execute("UPDATE lectures SET title=? WHERE id=?", (text, lid))
-        conn.commit()
-        conn.close()
-
-        log_admin_action(uid, f"✏️ Edited Lecture {lid} -> {text}")
-        context.user_data.clear()
-        await update.message.reply_text("✅ تم تعديل عنوان المحاضرة.")
-        return
-
+    # =======================
     # ADD SUBJECT
     if context.user_data.get("waiting_subject"):
         conn = db()
@@ -718,34 +573,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ تم إضافة المادة.")
         return
 
+    # =======================
     # ADD LECTURE TITLE
     if context.user_data.get("add_lec_subject"):
         context.user_data["lecture_title"] = text
         await update.message.reply_text("📤 الآن أرسل ملف PDF للمحاضرة")
         return
 
-    # ADD LINK TITLE
-    if context.user_data.get("add_link_step") == "title":
-        context.user_data["link_title"] = text
-        context.user_data["add_link_step"] = "url"
-        await update.message.reply_text("🔗 ابعت الرابط الآن:")
-        return
-
-    if context.user_data.get("add_link_step") == "url":
-        title = context.user_data["link_title"]
-        url = text
-
-        conn = db()
-        c = conn.cursor()
-        c.execute("INSERT INTO important_links(title,url) VALUES(?,?)", (title, url))
-        conn.commit()
-        conn.close()
-
-        log_admin_action(uid, f"🔗 Added Link {title}")
-        context.user_data.clear()
-        await update.message.reply_text("✅ تم إضافة اللينك.")
-        return
-
+    # =======================
     # BROADCAST
     if context.user_data.get("broadcast"):
         conn = db()
@@ -784,8 +619,10 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = db()
     c = conn.cursor()
-    c.execute("INSERT INTO lectures(subject_id,title,file_id) VALUES(?,?,?)",
-              (sid, title, file_id))
+    c.execute(
+        "INSERT INTO lectures(subject_id,title,file_id) VALUES(?,?,?)",
+        (sid, title, file_id)
+    )
     conn.commit()
     conn.close()
 
@@ -795,33 +632,58 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =======================
-# ADMIN COMMANDS
-async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MAIN_ADMIN_ID:
+# EXTRA ADMIN BUTTONS
+async def admin_buttons_extra(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_ENABLED
+    query = update.callback_query
+    uid = query.from_user.id
+
+    if not is_admin(uid):
         return
 
-    admin_id = int(context.args[0])
-    conn = db()
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (admin_id,))
-    conn.commit()
-    conn.close()
-
-    await update.message.reply_text("✅ تم إضافة أدمن جديد.")
-
-
-async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MAIN_ADMIN_ID:
+    # BACKUP
+    if query.data == "backup":
+        await query.message.reply_document(open(DB_FILE, "rb"))
+        await query.message.reply_text("✅ تم إرسال نسخة Backup.")
         return
 
-    admin_id = int(context.args[0])
-    conn = db()
-    c = conn.cursor()
-    c.execute("DELETE FROM admins WHERE user_id=?", (admin_id,))
-    conn.commit()
-    conn.close()
+    # BOT OFF
+    if query.data == "bot_off":
+        BOT_ENABLED = False
+        await query.message.reply_text("⏸ تم إيقاف البوت للطلاب.")
+        return
 
-    await update.message.reply_text("✅ تم حذف الأدمن.")
+    # BOT ON
+    if query.data == "bot_on":
+        BOT_ENABLED = True
+        await query.message.reply_text("▶️ تم تشغيل البوت للطلاب.")
+        return
+
+    # BROADCAST
+    if query.data == "broadcast":
+        context.user_data["broadcast"] = True
+        await query.message.reply_text("✍️ اكتب الرسالة لإرسالها لكل الطلاب:")
+        return
+
+    # STATS
+    if query.data == "stats":
+        conn = db()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM subjects")
+        sub_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM lectures")
+        lec_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users")
+        user_count = c.fetchone()[0]
+        conn.close()
+
+        await query.message.reply_text(
+            f"📊 الإحصائيات:\n\n"
+            f"📚 المواد: {sub_count}\n"
+            f"📄 المحاضرات: {lec_count}\n"
+            f"👥 الطلاب: {user_count}"
+        )
+        return
 
 
 # =======================
@@ -834,11 +696,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
 
-    app.add_handler(CommandHandler("addadmin", add_admin))
-    app.add_handler(CommandHandler("removeadmin", remove_admin))
-
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CallbackQueryHandler(admin_buttons))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
@@ -849,4 +707,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

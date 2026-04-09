@@ -8,7 +8,6 @@ from typing import Optional
 
 from telegram import Update
 from telegram.ext import (
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -23,10 +22,18 @@ from config import (
     PAGE_SIZE_SEARCH,
     PAGE_SIZE_SUBJECTS,
 )
-from handlers.common import ST_CONTACT, ST_REQ_LECTURE, ST_REQ_SUBJECT, ST_SEARCH, track_user, user_bot_accessible
+from handlers.common import (
+    ST_CONTACT,
+    ST_REQ_LECTURE,
+    ST_REQ_SUBJECT,
+    ST_SEARCH,
+    should_ignore_duplicate_callback,
+    should_ignore_duplicate_command,
+    track_user,
+    user_bot_accessible,
+)
 from keyboards import admin as kb_admin
 from keyboards import user as kb_user
-from services import favorites as fav_svc
 from services import search as search_svc
 
 logger = logging.getLogger(__name__)
@@ -39,7 +46,39 @@ async def _send_main_menu(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def render_subjects(
+    context: ContextTypes.DEFAULT_TYPE,
+    page: int,
+    *,
+    edit_query=None,
+    reply_message=None,
+) -> None:
+    """Single entry point for subjects list (commands, text, callbacks)."""
+    total = await db.count_subjects()
+    if total == 0:
+        text = "لا توجد مواد بعد."
+        kb = kb_user.main_menu_reply()
+        if edit_query:
+            await edit_query.edit_message_text(text, reply_markup=kb)
+        elif reply_message:
+            await reply_message.reply_text(text, reply_markup=kb)
+        return
+    total_pages = max(1, math.ceil(total / PAGE_SIZE_SUBJECTS))
+    page = max(0, min(page, total_pages - 1))
+    offset = page * PAGE_SIZE_SUBJECTS
+    rows = await db.list_subjects_page(offset, PAGE_SIZE_SUBJECTS)
+    text = "📚 المواد — اختر المادة:"
+    markup = kb_user.subjects_page_keyboard(rows, page, total_pages)
+    if edit_query:
+        await edit_query.edit_message_text(text, reply_markup=markup)
+    elif reply_message:
+        await reply_message.reply_text(text, reply_markup=markup)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    u = update.effective_user
+    if u and should_ignore_duplicate_command(context.application.bot_data, u.id, "start"):
+        return ConversationHandler.END
     await track_user(update)
     if not await user_bot_accessible(update):
         await update.effective_message.reply_text(
@@ -51,6 +90,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if u and should_ignore_duplicate_command(context.application.bot_data, u.id, "help"):
+        return
     await track_user(update)
     if not await user_bot_accessible(update):
         await update.effective_message.reply_text("⏹ البوت متوقف حاليًا.")
@@ -67,14 +109,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_subjects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    if u and should_ignore_duplicate_command(context.application.bot_data, u.id, "subjects"):
+        return
     await track_user(update)
     if not await user_bot_accessible(update):
         await update.effective_message.reply_text("⏹ البوت متوقف حاليًا.")
         return
-    await show_subjects_page(update.effective_message, context, page=0)
+    await render_subjects(context, 0, reply_message=update.effective_message)
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    u = update.effective_user
+    if u and should_ignore_duplicate_command(context.application.bot_data, u.id, "search"):
+        return ConversationHandler.END
     await track_user(update)
     if not await user_bot_accessible(update):
         await update.effective_message.reply_text("⏹ البوت متوقف حاليًا.")
@@ -87,8 +135,10 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await track_user(update)
     u = update.effective_user
+    if u and should_ignore_duplicate_command(context.application.bot_data, u.id, "admin"):
+        return
+    await track_user(update)
     if not u:
         return
     if await db.is_admin(u.id):
@@ -102,30 +152,11 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def show_subjects_page(message, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
-    total = await db.count_subjects()
-    if total == 0:
-        await message.reply_text(
-            "لا توجد مواد بعد.",
-            reply_markup=kb_user.main_menu_reply(),
-        )
-        return
-    total_pages = max(1, math.ceil(total / PAGE_SIZE_SUBJECTS))
-    page = max(0, min(page, total_pages - 1))
-    offset = page * PAGE_SIZE_SUBJECTS
-    rows = await db.list_subjects_page(offset, PAGE_SIZE_SUBJECTS)
-    await message.reply_text(
-        "📚 المواد — اختر المادة:",
-        reply_markup=kb_user.subjects_page_keyboard(rows, page, total_pages),
-    )
-
-
 async def show_lectures_for_subject(
     query,
     context: ContextTypes.DEFAULT_TYPE,
     subject_id: int,
     page: int,
-    user_id: int,
 ) -> None:
     sub = await db.get_subject(subject_id)
     if not sub:
@@ -145,8 +176,6 @@ async def show_lectures_for_subject(
     page = max(0, min(page, total_pages - 1))
     offset = page * PAGE_SIZE_LECTURES
     lectures = await db.list_lectures_page(subject_id, offset, PAGE_SIZE_LECTURES)
-    for lec in lectures:
-        lec["_fav"] = await db.is_favorite(user_id, lec["id"])
     text = f"📂 {sub['name']}\n\nاختر المحاضرة:"
     await query.edit_message_text(
         text,
@@ -170,10 +199,7 @@ async def user_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ConversationHandler.END
 
     if text == "📚 المواد":
-        await show_subjects_page(update.effective_message, context, page=0)
-        return ConversationHandler.END
-    if text == "⭐ المحاضرات المفضلة":
-        await show_favorites_page(update.effective_message, context, page=0, new_msg=True)
+        await render_subjects(context, 0, reply_message=update.effective_message)
         return ConversationHandler.END
     if text == "🆕 أحدث المحاضرات":
         await show_latest_page(update.effective_message, context, page=0, new_msg=True)
@@ -193,32 +219,6 @@ async def user_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ConversationHandler.END
 
     return None
-
-
-async def show_favorites_page(
-    message,
-    context: ContextTypes.DEFAULT_TYPE,
-    page: int,
-    new_msg: bool,
-    user_id: Optional[int] = None,
-) -> None:
-    uid = user_id or (message.from_user.id if message.from_user else None)
-    if uid is None:
-        return
-    rows, total, total_pages = await fav_svc.favorites_page(uid, page)
-    if total == 0:
-        text = "لا توجد محاضرات في المفضلة."
-        if new_msg:
-            await message.reply_text(text, reply_markup=kb_user.main_menu_reply())
-        else:
-            await message.edit_text(text, reply_markup=kb_user.main_menu_reply())
-        return
-    text = "⭐ المحاضرات المفضلة:"
-    markup = kb_user.favorites_keyboard(rows, page, total_pages)
-    if new_msg:
-        await message.reply_text(text, reply_markup=markup)
-    else:
-        await message.edit_text(text, reply_markup=markup)
 
 
 async def show_latest_page(
@@ -256,9 +256,6 @@ async def conv_search_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _send_main_menu(update.effective_message, context)
         return ConversationHandler.END
     rows, total, total_pages = await search_svc.search_page(q, 0)
-    uid = update.effective_user.id
-    for lec in rows:
-        lec["_fav"] = await db.is_favorite(uid, lec["id"])
     if total == 0:
         await update.effective_message.reply_text(
             "لا توجد نتائج.",
@@ -347,50 +344,50 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     q = update.callback_query
     if not q:
         return
-    await q.answer()
+    data = q.data or ""
+    uid = q.from_user.id
+    if should_ignore_duplicate_callback(context.application.bot_data, uid, data):
+        await q.answer()
+        return
+
     if not await user_bot_accessible(update):
+        await q.answer()
         await q.message.reply_text("⏹ البوت متوقف حاليًا.")
         return
-    data = q.data or ""
+
     parts = data.split("|")
     if data == "noop":
+        await q.answer()
         return
     if data == "home":
+        await q.answer()
         await q.message.reply_text(
             "القائمة الرئيسية:",
             reply_markup=kb_user.main_menu_reply(),
         )
         return
 
-    uid = q.from_user.id
+    await q.answer()
 
     if parts[0] == "usub":
         if parts[1] == "page":
             page = int(parts[2])
-            total = await db.count_subjects()
-            total_pages = max(1, math.ceil(total / PAGE_SIZE_SUBJECTS))
-            page = max(0, min(page, total_pages - 1))
-            offset = page * PAGE_SIZE_SUBJECTS
-            rows = await db.list_subjects_page(offset, PAGE_SIZE_SUBJECTS)
-            await q.edit_message_text(
-                "📚 المواد — اختر المادة:",
-                reply_markup=kb_user.subjects_page_keyboard(rows, page, total_pages),
-            )
+            await render_subjects(context, page, edit_query=q)
         elif parts[1] == "open":
             sid = int(parts[2])
-            await show_lectures_for_subject(q, context, sid, 0, uid)
+            await show_lectures_for_subject(q, context, sid, 0)
 
     elif parts[0] == "ulec":
         if parts[1] == "page":
             sid = int(parts[2])
             page = int(parts[3])
-            await show_lectures_for_subject(q, context, sid, page, uid)
+            await show_lectures_for_subject(q, context, sid, page)
         elif parts[1] == "open":
             lid = int(parts[2])
             sid = int(parts[3])
             lec = await db.get_lecture(lid)
             if not lec or lec["subject_id"] != sid:
-                await q.answer("المحاضرة غير موجودة.", show_alert=True)
+                await q.message.reply_text("المحاضرة غير موجودة.")
                 return
             try:
                 await context.bot.send_document(
@@ -400,22 +397,12 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 )
             except Exception as e:
                 logger.warning("send_document failed: %s", e)
-                await q.answer("تعذر إرسال الملف.", show_alert=True)
-        elif parts[1] == "fav":
-            lid = int(parts[2])
-            sid = int(parts[3])
-            was = int(parts[4])
-            cur_page = int(parts[5])
-            if was:
-                await db.remove_favorite(uid, lid)
-            else:
-                await db.add_favorite(uid, lid)
-            await show_lectures_for_subject(q, context, sid, cur_page, uid)
+                await q.message.reply_text("تعذر إرسال الملف.")
         elif parts[1] == "all":
             sid = int(parts[2])
             lecs = await db.list_all_lectures_in_subject(sid)
             if not lecs:
-                await q.answer("لا توجد ملفات.", show_alert=True)
+                await q.message.reply_text("لا توجد ملفات.")
                 return
             await q.message.reply_text(f"📥 جاري إرسال {len(lecs)} ملفًا...")
             for lec in lecs:
@@ -431,46 +418,14 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     elif parts[0] == "usea":
         query_text = context.user_data.get("last_search_query")
         if not query_text:
-            await q.answer("ابحث من جديد.", show_alert=True)
+            await q.message.reply_text("ابحث من جديد من القائمة.")
             return
         if parts[1] == "page":
             page = int(parts[2])
             rows, total, total_pages = await search_svc.search_page(query_text, page)
-            for lec in rows:
-                lec["_fav"] = await db.is_favorite(uid, lec["id"])
             await q.edit_message_text(
                 f"🔎 نتائج البحث عن: {query_text}",
                 reply_markup=kb_user.search_results_keyboard(rows, page, total_pages),
-            )
-        elif parts[1] == "fav":
-            lid = int(parts[2])
-            _ = int(parts[3])
-            was = int(parts[4])
-            page = int(parts[5])
-            if was:
-                await db.remove_favorite(uid, lid)
-            else:
-                await db.add_favorite(uid, lid)
-            rows, total, total_pages = await search_svc.search_page(query_text, page)
-            for lec in rows:
-                lec["_fav"] = await db.is_favorite(uid, lec["id"])
-            await q.edit_message_text(
-                f"🔎 نتائج البحث عن: {query_text}",
-                reply_markup=kb_user.search_results_keyboard(rows, page, total_pages),
-            )
-
-    elif parts[0] == "ufav":
-        if parts[1] == "page":
-            page = int(parts[2])
-            await show_favorites_page(
-                q.message, context, page, new_msg=False, user_id=uid
-            )
-        elif parts[1] == "rm":
-            lid = int(parts[2])
-            page = int(parts[3])
-            await db.remove_favorite(uid, lid)
-            await show_favorites_page(
-                q.message, context, page=page, new_msg=False, user_id=uid
             )
 
     elif parts[0] == "ulate":

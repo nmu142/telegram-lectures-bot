@@ -200,14 +200,12 @@ async def admin_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         u = await db.count_users()
         s = await db.count_subjects()
         l = await db.count_lectures_total()
-        f = await db.count_favorites_total()
         r = await db.count_requests()
         await update.effective_message.reply_text(
             "📊 الإحصائيات\n\n"
             f"👥 المستخدمون: {u}\n"
             f"📚 المواد: {s}\n"
             f"📄 المحاضرات: {l}\n"
-            f"⭐ المفضلة: {f}\n"
             f"📝 الطلبات: {r}\n"
         )
         return
@@ -392,9 +390,7 @@ async def admin_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await _admin_home_message(update.effective_message, context)
         return
 
-    from handlers import user as user_handlers
-
-    await user_handlers.user_text_router(update, context)
+    return
 
 
 async def _send_subject_pick(message, context: ContextTypes.DEFAULT_TYPE, prefix: str, page: int) -> None:

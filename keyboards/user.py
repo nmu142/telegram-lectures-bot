@@ -9,7 +9,6 @@ def main_menu_reply() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("📚 المواد")],
-            [KeyboardButton("⭐ المحاضرات المفضلة")],
             [KeyboardButton("🆕 أحدث المحاضرات")],
             [KeyboardButton("🔎 البحث عن محاضرة")],
             [KeyboardButton("📝 طلب محاضرة / نقص ملفات")],
@@ -89,14 +88,6 @@ def lectures_page_keyboard(
                 )
             ]
         )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "⭐ للمفضلة" if not lec.get("_fav") else "إزالة من المفضلة",
-                    callback_data=f"ulec|fav|{lid}|{subject_id}|{int(bool(lec.get('_fav')))}|{page}",
-                )
-            ]
-        )
     nav = []
     if total_pages > 1:
         if page > 0:
@@ -154,14 +145,6 @@ def search_results_keyboard(
                 )
             ]
         )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "⭐ للمفضلة" if not lec.get("_fav") else "إزالة من المفضلة",
-                    callback_data=f"usea|fav|{lid}|{sid}|{int(bool(lec.get('_fav')))}|{page}",
-                )
-            ]
-        )
     nav = []
     if total_pages > 1:
         if page > 0:
@@ -177,54 +160,6 @@ def search_results_keyboard(
             nav.append(
                 InlineKeyboardButton(
                     "التالي ▶️", callback_data=f"usea|page|{page + 1}"
-                )
-            )
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("🏠 الرئيسية", callback_data="home")])
-    return InlineKeyboardMarkup(rows)
-
-
-def favorites_keyboard(
-    items: list[dict],
-    page: int,
-    total_pages: int,
-) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for lec in items:
-        lid = lec["id"]
-        sid = lec["subject_id"]
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    f"📄 {lec['title'][:55]}",
-                    callback_data=f"ulec|open|{lid}|{sid}",
-                )
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "🗑 إزالة من المفضلة",
-                    callback_data=f"ufav|rm|{lid}|{page}",
-                )
-            ]
-        )
-    nav = []
-    if total_pages > 1:
-        if page > 0:
-            nav.append(
-                InlineKeyboardButton(
-                    "◀️ السابق", callback_data=f"ufav|page|{page - 1}"
-                )
-            )
-        nav.append(
-            InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop")
-        )
-        if page < total_pages - 1:
-            nav.append(
-                InlineKeyboardButton(
-                    "التالي ▶️", callback_data=f"ufav|page|{page + 1}"
                 )
             )
     if nav:

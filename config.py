@@ -26,7 +26,6 @@ ADMIN_DISPLAY_NAME = os.environ.get("ADMIN_DISPLAY_NAME", "Ahmed")
 PAGE_SIZE_SUBJECTS = 8
 PAGE_SIZE_LECTURES = 5
 PAGE_SIZE_SEARCH = 5
-PAGE_SIZE_FAVORITES = 5
 # Batch upload progress update interval (messages)
 BATCH_UPLOAD_PROGRESS_EVERY = 3
 

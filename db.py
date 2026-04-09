@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -58,13 +57,6 @@ async def init_db() -> None:
             created_at TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS favorites (
-            user_id INTEGER NOT NULL,
-            lecture_id INTEGER NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (user_id, lecture_id)
-        );
-
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY,
             added_by INTEGER,
@@ -102,9 +94,10 @@ async def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_lectures_subject ON lectures(subject_id);
         CREATE INDEX IF NOT EXISTS idx_lectures_created ON lectures(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
         """
     )
+    await _connection.commit()
+    await _connection.execute("DROP TABLE IF EXISTS favorites")
     await _connection.commit()
 
     cur = await _connection.execute(
@@ -526,73 +519,6 @@ async def latest_lectures_page(offset: int, limit: int) -> list[dict[str, Any]]:
 
 async def count_latest_lectures() -> int:
     return await count_lectures_total()
-
-
-# --- Favorites ---
-
-
-async def add_favorite(user_id: int, lecture_id: int) -> bool:
-    db = await get_db()
-    try:
-        await db.execute(
-            "INSERT INTO favorites (user_id, lecture_id, created_at) VALUES (?, ?, ?)",
-            (user_id, lecture_id, _now_iso()),
-        )
-        await db.commit()
-        return True
-    except aiosqlite.IntegrityError:
-        return False
-
-
-async def remove_favorite(user_id: int, lecture_id: int) -> None:
-    db = await get_db()
-    await db.execute(
-        "DELETE FROM favorites WHERE user_id = ? AND lecture_id = ?",
-        (user_id, lecture_id),
-    )
-    await db.commit()
-
-
-async def is_favorite(user_id: int, lecture_id: int) -> bool:
-    db = await get_db()
-    cur = await db.execute(
-        "SELECT 1 FROM favorites WHERE user_id = ? AND lecture_id = ?",
-        (user_id, lecture_id),
-    )
-    return await cur.fetchone() is not None
-
-
-async def list_favorites_page(user_id: int, offset: int, limit: int) -> list[dict[str, Any]]:
-    db = await get_db()
-    cur = await db.execute(
-        """
-        SELECT l.*, s.name AS subject_name FROM favorites f
-        JOIN lectures l ON l.id = f.lecture_id
-        JOIN subjects s ON s.id = l.subject_id
-        WHERE f.user_id = ?
-        ORDER BY f.created_at DESC
-        LIMIT ? OFFSET ?
-        """,
-        (user_id, limit, offset),
-    )
-    rows = await cur.fetchall()
-    return [dict(r) for r in rows]
-
-
-async def count_user_favorites(user_id: int) -> int:
-    db = await get_db()
-    cur = await db.execute(
-        "SELECT COUNT(*) FROM favorites WHERE user_id = ?", (user_id,)
-    )
-    row = await cur.fetchone()
-    return int(row[0]) if row else 0
-
-
-async def count_favorites_total() -> int:
-    db = await get_db()
-    cur = await db.execute("SELECT COUNT(*) FROM favorites")
-    row = await cur.fetchone()
-    return int(row[0]) if row else 0
 
 
 # --- Links ---

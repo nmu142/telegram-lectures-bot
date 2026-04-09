@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import traceback
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -10,6 +11,32 @@ from telegram.ext import ContextTypes
 import db
 
 logger = logging.getLogger(__name__)
+
+DEBOUNCE_CALLBACK_S = 0.5
+DEBOUNCE_COMMAND_S = 0.5
+
+
+def should_ignore_duplicate_callback(bot_data: dict, user_id: int, data: str) -> bool:
+    """True if the same callback_data was handled for this user within DEBOUNCE_CALLBACK_S."""
+    key = ("cbdeb", user_id, data)
+    now = time.monotonic()
+    last = bot_data.get(key)
+    if last is not None and (now - last) < DEBOUNCE_CALLBACK_S:
+        return True
+    bot_data[key] = now
+    return False
+
+
+def should_ignore_duplicate_command(bot_data: dict, user_id: int, command: str) -> bool:
+    """True if the same command was run for this user within DEBOUNCE_COMMAND_S."""
+    key = ("cmddeb", user_id, command)
+    now = time.monotonic()
+    last = bot_data.get(key)
+    if last is not None and (now - last) < DEBOUNCE_COMMAND_S:
+        return True
+    bot_data[key] = now
+    return False
+
 
 # Conversation states (single range for all handlers)
 (
@@ -71,9 +98,16 @@ async def user_bot_accessible(update: Update) -> bool:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception(
-        "Unhandled error: %s\nUpdate: %s", context.error, update, exc_info=context.error
-    )
+    exc = context.error
+    if exc:
+        logger.error(
+            "Unhandled error: %s | update=%s",
+            exc,
+            update,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+    else:
+        logger.error("Error without exception | update=%s", update)
     err_text = "حدث خطأ غير متوقع. حاول مرة أخرى لاحقًا."
     if isinstance(update, Update):
         try:

@@ -2177,12 +2177,16 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 def main() -> None:
     logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    async def _post_init(app: Application) -> None:
+        await init_db()
+        app.job_queue.run_repeating(_job_backup, interval=60 * 30, first=60 * 5)
+
     application = (
-    Application.builder()
-    .token(TOKEN)
-    .post_init(_post_init)
-    .build()
-)
+        Application.builder()
+        .token(TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
 
     # shared runtime state
     application.bot_data["limiter"] = RateLimiter()
@@ -2203,10 +2207,6 @@ def main() -> None:
     # messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     application.add_handler(MessageHandler(filters.Document.ALL, admin_document))
-
-    async def _post_init(app: Application) -> None:
-        await init_db()
-        app.job_queue.run_repeating(_job_backup, interval=60 * 30, first=60 * 5)
 
     print("BOT STARTED")
     LOG.info("Starting polling...")

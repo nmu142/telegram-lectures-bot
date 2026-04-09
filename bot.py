@@ -121,7 +121,7 @@ async def _add_column_if_missing(conn: aiosqlite.Connection, table: str, column:
 
 async def init_db() -> None:
     restore_db()
-    async with await db_connect() as conn:
+  async with db_connect() as conn:
         await conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS subjects (
@@ -304,7 +304,7 @@ class RateLimiter:
 async def is_admin(uid: int) -> bool:
     if uid == MAIN_ADMIN_ID:
         return True
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)) as cur:
             row = await cur.fetchone()
             return row is not None
@@ -507,7 +507,7 @@ async def register_user(update: Update) -> None:
         return
     u = update.effective_user
     now = int(time.time())
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         await conn.execute(
             """
             INSERT INTO users(user_id, username, first_name, last_name, updated_at)
@@ -595,7 +595,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lid = _parse_int_param(data, "id")
         if lid is None:
             return
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             async with conn.execute("SELECT file_id, title FROM lectures WHERE id=?", (lid,)) as cur:
                 row = await cur.fetchone()
             if not row:
@@ -620,7 +620,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if lid is None:
             return
         now = int(time.time())
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             async with conn.execute(
                 "SELECT 1 FROM favorites WHERE user_id=? AND lecture_id=?",
                 (uid, lid),
@@ -694,7 +694,7 @@ async def user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         context.user_data.pop("waiting_request_text", None)
         now = int(time.time())
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             await conn.execute(
                 "INSERT INTO requests(user_id, text, created_at, status) VALUES(?,?,?,?)",
                 (uid, text, now, "new"),
@@ -727,7 +727,7 @@ async def show_subjects(query, page: int) -> None:
             loading_msg = await query.message.reply_text("⏳ جاري تحميل المواد...")
     except Exception:
         loading_msg = None
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             """
             SELECT id, name
@@ -774,7 +774,7 @@ async def show_lectures(query, subject_id: int, page: int) -> None:
             loading_msg = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
     except Exception:
         loading_msg = None
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             """
             SELECT id, title
@@ -823,7 +823,7 @@ async def show_lectures(query, subject_id: int, page: int) -> None:
 async def show_links(query, page: int) -> None:
     PAGE_SIZE = 12
     offset = page * PAGE_SIZE
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             """
             SELECT id, title, url
@@ -850,7 +850,7 @@ async def show_links(query, page: int) -> None:
 
 
 async def show_latest(query) -> None:
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             "SELECT id, title FROM lectures ORDER BY created_at DESC, id DESC LIMIT 10"
         ) as cur:
@@ -875,7 +875,7 @@ async def show_search_results(target, query_text: str, page: int, is_message: bo
         else:
             await target.message.reply_text("⚠️ اكتب كلمة للبحث.", reply_markup=markup([nav_row()]))
         return
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         # Prefer FTS when available; fallback to LIKE
         try:
             fts_q = " ".join([p + "*" for p in q.split() if p])
@@ -930,7 +930,7 @@ async def show_search_results(target, query_text: str, page: int, is_message: bo
 async def show_favorites(query, user_id: int, page: int) -> None:
     PAGE_SIZE = 12
     offset = page * PAGE_SIZE
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             """
             SELECT l.id, l.title
@@ -963,7 +963,7 @@ SORT_PAGE_SIZE = 8
 
 
 async def _ensure_manual_order_subjects() -> None:
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             """
             SELECT id
@@ -984,7 +984,7 @@ async def _ensure_manual_order_subjects() -> None:
 
 
 async def _ensure_manual_order_lectures(subject_id: int) -> None:
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             """
             SELECT id
@@ -1013,7 +1013,7 @@ async def _ensure_manual_order_lectures(subject_id: int) -> None:
 
 async def _swap_subject_order(subject_id: int, direction: str) -> None:
     await _ensure_manual_order_subjects()
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             "SELECT id, manual_order FROM subjects ORDER BY manual_order, id"
         ) as cur:
@@ -1039,7 +1039,7 @@ async def _swap_subject_order(subject_id: int, direction: str) -> None:
 
 async def _swap_lecture_order(subject_id: int, lecture_id: int, direction: str) -> None:
     await _ensure_manual_order_lectures(subject_id)
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             "SELECT id, manual_order FROM lectures WHERE subject_id=? ORDER BY manual_order, id",
             (subject_id,),
@@ -1067,7 +1067,7 @@ async def _swap_lecture_order(subject_id: int, lecture_id: int, direction: str) 
 async def _admin_show_sort_subjects(query, page: int) -> None:
     await _ensure_manual_order_subjects()
     offset = page * SORT_PAGE_SIZE
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             """
             SELECT id, name
@@ -1101,7 +1101,7 @@ async def _admin_show_sort_subjects(query, page: int) -> None:
 async def _admin_show_sort_lectures(query, subject_id: int, page: int) -> None:
     await _ensure_manual_order_lectures(subject_id)
     offset = page * SORT_PAGE_SIZE
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute("SELECT name FROM subjects WHERE id=?", (subject_id,)) as cur:
             sub = await cur.fetchone()
         async with conn.execute(
@@ -1286,7 +1286,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sid = _parse_int_param(data, "id")
         if sid is None:
             return
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             await conn.execute("DELETE FROM lectures WHERE subject_id=?", (sid,))
             await conn.execute("DELETE FROM subjects WHERE id=?", (sid,))
             await conn.commit()
@@ -1330,7 +1330,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         lid = _parse_int_param(data, "id")
         if sid is None or lid is None:
             return
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             await conn.execute("DELETE FROM favorites WHERE lecture_id=?", (lid,))
             await conn.execute("DELETE FROM lectures WHERE id=? AND subject_id=?", (lid, sid))
             await conn.commit()
@@ -1416,7 +1416,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         lid = _parse_int_param(data, "id")
         if lid is None:
             return
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             await conn.execute("DELETE FROM important_links WHERE id=?", (lid,))
             await conn.commit()
         save_db()
@@ -1431,7 +1431,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # ---- Clean data ----
     if data == "a:clean":
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             # remove favorites pointing to missing lectures
             await conn.execute(
                 "DELETE FROM favorites WHERE lecture_id NOT IN (SELECT id FROM lectures)"
@@ -1456,7 +1456,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if aid == MAIN_ADMIN_ID:
             await query.message.reply_text("⚠️ لا يمكن حذف الأدمن الرئيسي.", reply_markup=admin_panel_keyboard())
             return
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             await conn.execute("DELETE FROM admins WHERE user_id=?", (aid,))
             await conn.commit()
         save_db()
@@ -1473,7 +1473,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == "a:stats":
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             async with conn.execute("SELECT COUNT(*) AS c FROM users") as cur1:
                 users_c = int((await cur1.fetchone())["c"])
             async with conn.execute("SELECT COUNT(*) AS c FROM subjects") as cur2:
@@ -1555,7 +1555,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if mode == "add_subject":
         now = int(time.time())
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             try:
                 await conn.execute(
                     "INSERT INTO subjects(name, created_at) VALUES(?, ?)",
@@ -1573,7 +1573,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if mode == "import_folder_ask_subject":
         subject_name = text
         now = int(time.time())
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             # create subject if missing
             await conn.execute(
                 "INSERT OR IGNORE INTO subjects(name, created_at) VALUES(?, ?)",
@@ -1609,7 +1609,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         sid = context.user_data.get("edit_subject_id")
         if not isinstance(sid, int):
             return
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             try:
                 await conn.execute("UPDATE subjects SET name=? WHERE id=?", (text, sid))
                 await conn.commit()
@@ -1628,7 +1628,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if not isinstance(sid, int) or not isinstance(lid, int):
             return
         # Duplicate protection (per-subject) for edited titles
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             async with conn.execute(
                 "SELECT 1 FROM lectures WHERE subject_id=? AND title=? AND id<>?",
                 (sid, text, lid),
@@ -1671,7 +1671,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         url = text
         if not isinstance(title, str) or not url:
             return
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             await conn.execute(
                 "INSERT INTO important_links(title, url, position) VALUES(?,?,?)",
                 (title, url, 999),
@@ -1685,7 +1685,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if mode == "broadcast_text":
         msg = text
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             async with conn.execute("SELECT user_id FROM users") as cur:
                 users = [int(r["user_id"]) for r in await cur.fetchall()]
 
@@ -1741,7 +1741,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text("✅ الأدمن الرئيسي موجود بالفعل.", reply_markup=admin_panel_keyboard())
             context.user_data.pop("admin_mode", None)
             return
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             await conn.execute("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (new_id,))
             await conn.commit()
         save_db()
@@ -1753,7 +1753,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         q = text.strip().lstrip("@")
         if not q:
             return
-        async with await db_connect() as conn:
+        async with db_connect() as conn:
             if q.isdigit():
                 async with conn.execute(
                     "SELECT user_id, username, first_name, last_name FROM users WHERE user_id=?",
@@ -1796,7 +1796,7 @@ async def _admin_choose_subject_for_upload(query, page: int, cb_base: str) -> No
             loading_msg = await query.message.reply_text("⏳ جاري تحميل المواد...")
     except Exception:
         loading_msg = None
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             """
             SELECT id, name
@@ -1845,7 +1845,7 @@ async def _admin_choose_lecture(query, subject_id: int, page: int, cb_base: str)
             loading_msg = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
     except Exception:
         loading_msg = None
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             """
             SELECT id, title
@@ -1892,7 +1892,7 @@ async def _admin_show_links_manage(query, page: int) -> None:
             loading_msg = await query.message.reply_text("⏳ جاري تحميل الروابط...")
     except Exception:
         loading_msg = None
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             """
             SELECT id, title, url
@@ -1946,7 +1946,7 @@ async def _admin_show_links_manage(query, page: int) -> None:
 
 
 async def _ensure_links_positions() -> None:
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             "SELECT id FROM important_links ORDER BY position, id"
         ) as cur:
@@ -1961,7 +1961,7 @@ async def _ensure_links_positions() -> None:
 
 async def _swap_link_position(link_id: int, direction: str) -> None:
     await _ensure_links_positions()
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             "SELECT id, position FROM important_links ORDER BY position, id"
         ) as cur:
@@ -1986,7 +1986,7 @@ async def _swap_link_position(link_id: int, direction: str) -> None:
 
 
 async def _admin_show_admins(query) -> None:
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute("SELECT user_id FROM admins ORDER BY user_id") as cur:
             rows = await cur.fetchall()
     buttons: list[list[InlineKeyboardButton]] = []
@@ -2012,7 +2012,7 @@ def _split_filename(name: str) -> tuple[str, str]:
 async def _dedupe_lecture_title(subject_id: int, title: str) -> str:
     base, ext = _split_filename(title)
     candidate = f"{base}{ext}"
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         async with conn.execute(
             "SELECT 1 FROM lectures WHERE subject_id=? AND title=?",
             (subject_id, candidate),
@@ -2061,7 +2061,7 @@ async def admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["upload_counters"] = counters
 
     now = int(time.time())
-    async with await db_connect() as conn:
+    async with db_connect() as conn:
         try:
             # De-dupe title within the same transaction/connection
             base, ext = _split_filename(raw_title)
@@ -2177,7 +2177,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 def main() -> None:
     logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    application = Application.builder().token(TOKEN).build()
+    application = (
+    Application.builder()
+    .token(TOKEN)
+    .post_init(_post_init)
+    .build()
+)
 
     # shared runtime state
     application.bot_data["limiter"] = RateLimiter()
@@ -2202,8 +2207,6 @@ def main() -> None:
     async def _post_init(app: Application) -> None:
         await init_db()
         app.job_queue.run_repeating(_job_backup, interval=60 * 30, first=60 * 5)
-
-    application.post_init = _post_init  # type: ignore[attr-defined]
 
     print("BOT STARTED")
     LOG.info("Starting polling...")

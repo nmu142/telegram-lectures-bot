@@ -59,7 +59,7 @@ UPLOAD_SESSION_TIMEOUT_S = int(os.getenv("UPLOAD_SESSION_TIMEOUT_S", str(20 * 60
 UPLOAD_PROGRESS_EDIT_EVERY_S = float(os.getenv("UPLOAD_PROGRESS_EDIT_EVERY_S", "2.5"))
 LIST_LOADING_EDIT = True
 ANTI_DOUBLE_CLICK_WINDOW_S = 0.0
-DB_BUSY_TIMEOUT_MS = int(os.getenv("DB_BUSY_TIMEOUT_MS", "8000"))
+DB_BUSY_TIMEOUT_MS = int(os.getenv("DB_BUSY_TIMEOUT_MS", "5000"))
 AUTO_RESTART_MAX_RETRIES = int(os.getenv("AUTO_RESTART_MAX_RETRIES", "0"))  # 0 = infinite
 AUTO_RESTART_BASE_DELAY_S = float(os.getenv("AUTO_RESTART_BASE_DELAY_S", "1.5"))
 
@@ -195,13 +195,15 @@ async def db_connect() -> aiosqlite.Connection:
     async def _setup(c: aiosqlite.Connection) -> None:
         await c.execute("PRAGMA journal_mode=WAL")
         await c.execute("PRAGMA synchronous=NORMAL")
+        await c.execute("PRAGMA temp_store=MEMORY")
         await c.execute("PRAGMA foreign_keys=ON")
-        await c.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
+        # Enforce 5000ms busy_timeout to reduce lock-related failures.
+        await c.execute("PRAGMA busy_timeout=5000")
         c.row_factory = aiosqlite.Row
 
-    async def _quick_ok(c: aiosqlite.Connection) -> bool:
+    async def _integrity_ok(c: aiosqlite.Connection) -> bool:
         try:
-            async with c.execute("PRAGMA quick_check(1)") as cur:
+            async with c.execute("PRAGMA integrity_check(1)") as cur:
                 row = await cur.fetchone()
             return bool(row) and str(row[0]).lower() == "ok"
         except Exception:
@@ -211,7 +213,7 @@ async def db_connect() -> aiosqlite.Connection:
     conn = await aiosqlite.connect(DB_FILE, timeout=max(1.0, DB_BUSY_TIMEOUT_MS / 1000.0))
     try:
         await _setup(conn)
-        if await _quick_ok(conn):
+        if await _integrity_ok(conn):
             return conn
     except Exception as e:
         # fall through to recovery
@@ -231,7 +233,7 @@ async def db_connect() -> aiosqlite.Connection:
 
     conn2 = await aiosqlite.connect(DB_FILE, timeout=max(1.0, DB_BUSY_TIMEOUT_MS / 1000.0))
     await _setup(conn2)
-    if await _quick_ok(conn2):
+    if await _integrity_ok(conn2):
         return conn2
 
     # If backup is also corrupted, self-heal by creating a new DB file.

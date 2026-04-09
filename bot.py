@@ -47,14 +47,10 @@ MAINTENANCE_MESSAGE = os.getenv(
 )
 
 # Rate Limit (legacy constants kept)
-RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "10"))
-RATE_LIMIT_MAX_MESSAGES = int(os.getenv("RATE_LIMIT_MAX_MESSAGES", "5"))
-RATE_LIMIT_BLOCK_SECONDS = int(os.getenv("RATE_LIMIT_BLOCK_SECONDS", "10"))
-
-RATE_LIMIT_MESSAGE = os.getenv(
-    "RATE_LIMIT_MESSAGE",
-    "🚫 برجاء الانتظار 10 ثواني قبل إرسال رسائل جديدة حتى لا يتعطل البوت.",
-)
+RATE_LIMIT_WINDOW = 0
+RATE_LIMIT_MAX_MESSAGES = 0
+RATE_LIMIT_BLOCK_SECONDS = 0
+RATE_LIMIT_MESSAGE = ""
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -62,7 +58,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 UPLOAD_SESSION_TIMEOUT_S = int(os.getenv("UPLOAD_SESSION_TIMEOUT_S", str(20 * 60)))
 UPLOAD_PROGRESS_EDIT_EVERY_S = float(os.getenv("UPLOAD_PROGRESS_EDIT_EVERY_S", "2.5"))
 LIST_LOADING_EDIT = True
-ANTI_DOUBLE_CLICK_WINDOW_S = float(os.getenv("ANTI_DOUBLE_CLICK_WINDOW_S", "0.8"))
+ANTI_DOUBLE_CLICK_WINDOW_S = 0.0
 DB_BUSY_TIMEOUT_MS = int(os.getenv("DB_BUSY_TIMEOUT_MS", "8000"))
 AUTO_RESTART_MAX_RETRIES = int(os.getenv("AUTO_RESTART_MAX_RETRIES", "0"))  # 0 = infinite
 AUTO_RESTART_BASE_DELAY_S = float(os.getenv("AUTO_RESTART_BASE_DELAY_S", "1.5"))
@@ -369,27 +365,8 @@ async def init_db() -> None:
 
 
 class RateLimiter:
-    def __init__(self) -> None:
-        self.user_messages: dict[int, list[float]] = {}
-        self.blocked_until: dict[int, float] = {}
-
+    # disabled (kept only to avoid breaking bot_data wiring)
     def check(self, user_id: int) -> bool:
-        now = time.time()
-        until = self.blocked_until.get(user_id)
-        if until and now < until:
-            return False
-        if until and now >= until:
-            self.blocked_until.pop(user_id, None)
-
-        msgs = self.user_messages.setdefault(user_id, [])
-        cutoff = now - RATE_LIMIT_WINDOW
-        while msgs and msgs[0] < cutoff:
-            msgs.pop(0)
-        msgs.append(now)
-        if len(msgs) > RATE_LIMIT_MAX_MESSAGES:
-            self.blocked_until[user_id] = now + RATE_LIMIT_BLOCK_SECONDS
-            self.user_messages[user_id] = []
-            return False
         return True
 
 
@@ -621,11 +598,7 @@ async def register_user(update: Update) -> None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    limiter: RateLimiter = context.application.bot_data["limiter"]
     uid = update.effective_user.id if update.effective_user else 0
-    if uid and not limiter.check(uid):
-        await update.message.reply_text(RATE_LIMIT_MESSAGE)
-        return
 
     if not BOT_ENABLED and uid and not await is_admin(uid):
         await update.message.reply_text(MAINTENANCE_MESSAGE)
@@ -644,11 +617,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     await safe_answer(query)
 
-    limiter: RateLimiter = context.application.bot_data["limiter"]
     uid = query.from_user.id
-    if not limiter.check(uid):
-        await query.message.reply_text(RATE_LIMIT_MESSAGE)
-        return
 
     if not BOT_ENABLED and not await is_admin(uid):
         await query.message.reply_text(MAINTENANCE_MESSAGE)
@@ -656,15 +625,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     data = query.data or ""
 
-    # Anti double-click (same callback quickly)
-    try:
-        now = time.time()
-        last = context.user_data.get("_last_cb")
-        if isinstance(last, dict) and last.get("d") == data and (now - float(last.get("t", 0.0))) < ANTI_DOUBLE_CLICK_WINDOW_S:
-            return
-        context.user_data["_last_cb"] = {"d": data, "t": now}
-    except Exception:
-        pass
+    # No cooldown / unlimited clicks (rate limiter removed)
     # Log user button clicks for debugging
     try:
         LOG.info("USER_CLICK: %s %s", uid, data)
@@ -700,6 +661,15 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         page = _parse_page(data)
         loading = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
         schedule_task(context, _bg_show_lectures(loading, sid, page), name="bg_show_lectures")
+        return
+
+    if data.startswith("u:download_all:"):
+        sid = _parse_int_param(data, "s")
+        if sid is None:
+            await query.message.reply_text("⚠️ حدث خطأ في تحميل المحاضرات.")
+            return
+        progress = await query.message.reply_text("⏳ جاري تنفيذ التحميل...")
+        schedule_task(context, _bg_download_all(progress, sid), name="bg_download_all")
         return
 
     if data.startswith("u:lec:"):
@@ -763,11 +733,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
-    limiter: RateLimiter = context.application.bot_data["limiter"]
     uid = update.effective_user.id
-    if not limiter.check(uid):
-        await update.message.reply_text(RATE_LIMIT_MESSAGE)
-        return
 
     if not BOT_ENABLED and not await is_admin(uid):
         await update.message.reply_text(MAINTENANCE_MESSAGE)
@@ -954,6 +920,7 @@ async def _render_lectures_into(message, subject_id: int, page: int) -> None:
     rows = rows[:PAGE_SIZE]
     buttons = [btn(f"📄 {r['title']}", f"u:lec:id={r['id']}") for r in rows]
     keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.append([btn("📥 تحميل كل محاضرات المادة", f"u:download_all:s={subject_id}")])
     keyboard.extend(grid_2col(buttons))
     keyboard.append(
         pagination_row(
@@ -1091,6 +1058,57 @@ async def _bg_show_lectures(loading_msg, subject_id: int, page: int) -> None:
     except Exception as e:
         LOG.exception("فشل تحميل المحاضرات", exc_info=e)
         await safe_edit(loading_msg, "⚠️ حدث خطأ أثناء تحميل المحاضرات.")
+
+
+async def _bg_download_all(progress_msg, subject_id: int) -> None:
+    try:
+        async with db_conn() as conn:
+            async with conn.execute("SELECT name FROM subjects WHERE id=?", (subject_id,)) as cur:
+                sub = await cur.fetchone()
+            subject_name = sub["name"] if sub else str(subject_id)
+
+            async with conn.execute(
+                """
+                SELECT id, title, file_id
+                FROM lectures
+                WHERE subject_id=?
+                ORDER BY
+                  CASE WHEN manual_order IS NULL THEN 1 ELSE 0 END,
+                  manual_order ASC,
+                  created_at DESC,
+                  id DESC
+                """,
+                (subject_id,),
+            ) as cur2:
+                lectures = await cur2.fetchall()
+
+        total = len(lectures)
+        if total == 0:
+            await safe_edit(progress_msg, f"📭 لا توجد محاضرات في مادة: {subject_name}")
+            return
+
+        await safe_edit(progress_msg, f"📥 جاري إرسال محاضرات مادة: {subject_name}\n\n0/{total}")
+
+        sent = 0
+        for r in lectures:
+            file_id = r["file_id"]
+            title = r["title"]
+            try:
+                await progress_msg.chat.send_document(
+                    document=file_id,
+                    caption=f"📄 {title}",
+                )
+                sent += 1
+            except Exception:
+                LOG.exception("فشل إرسال محاضرة ضمن تحميل الكل (subject=%s lecture_id=%s)", subject_id, r["id"])
+            if sent == total or sent % 5 == 0:
+                await safe_edit(progress_msg, f"📥 جاري إرسال محاضرات مادة: {subject_name}\n\n{sent}/{total}")
+            await asyncio.sleep(0.05)
+
+        await safe_edit(progress_msg, f"✅ تم إرسال محاضرات مادة: {subject_name}\n\n{sent}/{total}")
+    except Exception as e:
+        LOG.exception("فشل تحميل كل محاضرات المادة", exc_info=e)
+        await safe_edit(progress_msg, "⚠️ حدث خطأ أثناء تحميل كل محاضرات المادة.")
 
 
 async def _bg_send_lecture(loading_msg, user_id: int, lecture_id: int) -> None:
@@ -1560,22 +1578,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not await is_admin(uid):
         return
 
-    # Rate-limit admin callbacks too (prevents floods)
-    limiter: RateLimiter = context.application.bot_data["limiter"]
-    if not limiter.check(uid):
-        await query.message.reply_text(RATE_LIMIT_MESSAGE)
-        return
-
-    # Anti double-click (same callback quickly)
-    try:
-        now = time.time()
-        last = context.user_data.get("_last_cb_admin")
-        d = query.data or ""
-        if isinstance(last, dict) and last.get("d") == d and (now - float(last.get("t", 0.0))) < ANTI_DOUBLE_CLICK_WINDOW_S:
-            return
-        context.user_data["_last_cb_admin"] = {"d": d, "t": now}
-    except Exception:
-        pass
+    # No cooldown / unlimited clicks (rate limiter removed)
 
     if cleanup_expired_upload_session(context):
         await query.message.reply_text("⌛ انتهت جلسة الرفع. ابدأ من لوحة الأدمن مرة أخرى.", reply_markup=admin_panel_keyboard())
@@ -1747,10 +1750,37 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         lid = _parse_int_param(data, "id")
         if sid is None or lid is None:
             return
+        # Confirmation with subject + lecture names
+        async with db_conn() as conn:
+            async with conn.execute("SELECT name FROM subjects WHERE id=?", (sid,)) as cur1:
+                sub = await cur1.fetchone()
+            async with conn.execute("SELECT title FROM lectures WHERE id=? AND subject_id=?", (lid, sid)) as cur2:
+                lec = await cur2.fetchone()
+        sub_name = sub["name"] if sub else str(sid)
+        lec_title = lec["title"] if lec else str(lid)
         await query.message.reply_text(
-            "⚠️ تأكيد حذف المحاضرة؟",
-            reply_markup=markup([[btn("🗑️ تأكيد الحذف", f"a:delete_lecture_confirm:s={sid}:id={lid}")], admin_nav_row()]),
+            "⚠️ تأكيد الحذف\n\n"
+            f"المادة: {sub_name}\n"
+            f"المحاضرة: {lec_title}\n\n"
+            "هل تريد حذف هذه المحاضرة؟",
+            reply_markup=markup(
+                [
+                    [btn("✅ تأكيد الحذف", f"a:delete_lecture_confirm:s={sid}:id={lid}")],
+                    [btn("❌ إلغاء", f"a:delete_lecture_cancel:s={sid}:p=0")],
+                    admin_nav_row(),
+                ]
+            ),
         )
+        return
+
+    if data.startswith("a:delete_lecture_cancel:"):
+        sid = _parse_int_param(data, "s")
+        page = _parse_page(data)
+        if sid is None:
+            await query.message.reply_text("⚠️ حدث خطأ.", reply_markup=admin_panel_keyboard())
+            return
+        loading = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
+        schedule_task(context, _bg_admin_choose_lecture(loading, sid, page, f"a:delete_lecture_list:s={sid}"), name="bg_admin_choose_lecture_del_cancel")
         return
     if data.startswith("a:delete_lecture_confirm:"):
         sid = _parse_int_param(data, "s")
@@ -2543,11 +2573,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message or not update.effective_user:
         return
     uid = update.effective_user.id
-
-    limiter: RateLimiter = context.application.bot_data["limiter"]
-    if not limiter.check(uid):
-        await update.message.reply_text(RATE_LIMIT_MESSAGE)
-        return
 
     if not BOT_ENABLED and not await is_admin(uid):
         await update.message.reply_text(MAINTENANCE_MESSAGE)

@@ -2174,48 +2174,45 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # APP BOOTSTRAP
 
 
+def main() -> None:
+    logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    application = Application.builder().token(TOKEN).build()
+
+    # shared runtime state
+    application.bot_data["limiter"] = RateLimiter()
+
+    # errors
+    application.add_error_handler(error_handler)
+
+    # commands
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin_panel))
+
+    # callbacks
+    application.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
+    application.add_handler(CallbackQueryHandler(user_callbacks, pattern=r"^u:"))
+    application.add_handler(CallbackQueryHandler(admin_callbacks, pattern=r"^a:"))
+    application.add_handler(CallbackQueryHandler(user_callbacks, pattern=r"^nav:"))
+
+    # messages
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    application.add_handler(MessageHandler(filters.Document.ALL, admin_document))
+
+    async def _post_init(app: Application) -> None:
+        await init_db()
+        app.job_queue.run_repeating(_job_backup, interval=60 * 30, first=60 * 5)
+
+    application.post_init = _post_init  # type: ignore[attr-defined]
+
+    print("BOT STARTED")
+    LOG.info("Starting polling...")
+    application.run_polling()
+
+
 if __name__ == "__main__":
-    async def main() -> None:
-        logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
-        application = Application.builder().token(TOKEN).build()
-
-        # shared runtime state
-        application.bot_data["limiter"] = RateLimiter()
-
-        # errors
-        application.add_error_handler(error_handler)
-
-        # commands
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("admin", admin_panel))
-
-        # callbacks
-        application.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
-        application.add_handler(CallbackQueryHandler(user_callbacks, pattern=r"^u:"))
-        application.add_handler(CallbackQueryHandler(admin_callbacks, pattern=r"^a:"))
-        application.add_handler(CallbackQueryHandler(user_callbacks, pattern=r"^nav:"))
-
-        # messages
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-        application.add_handler(MessageHandler(filters.Document.ALL, admin_document))
-
-        async def _post_init(app: Application) -> None:
-            # DB init is triggered during startup lifecycle
-            await init_db()
-            # schedule backups after startup
-            app.job_queue.run_repeating(_job_backup, interval=60 * 30, first=60 * 5)
-
-        application.post_init = _post_init  # type: ignore[attr-defined]
-
-        print("BOT STARTED")
-        LOG.info("Starting polling...")
-
-        # PTB run_polling is synchronous (blocks). We call it last.
-        application.run_polling()
-
     try:
-        asyncio.run(main())
+        main()
     except Exception:
         logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         LOG.exception("Startup failed")

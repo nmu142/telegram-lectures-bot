@@ -135,8 +135,25 @@ def log_admin_action(user_id: int, action: str) -> None:
 
 def save_db() -> None:
     try:
-        if os.path.exists(DB_FILE):
-            shutil.copy(DB_FILE, BACKUP_FILE)
+        # Use SQLite backup API to avoid corrupt backups under WAL.
+        import sqlite3
+
+        if not os.path.exists(DB_FILE):
+            return
+        src = sqlite3.connect(DB_FILE)
+        try:
+            try:
+                src.execute("PRAGMA wal_checkpoint(FULL)")
+            except Exception:
+                pass
+            dst = sqlite3.connect(BACKUP_FILE)
+            try:
+                src.backup(dst)
+                dst.commit()
+            finally:
+                dst.close()
+        finally:
+            src.close()
     except Exception:
         pass
 
@@ -147,6 +164,27 @@ def restore_db() -> None:
             shutil.copy(BACKUP_FILE, DB_FILE)
     except Exception:
         pass
+
+
+def _restore_db_force() -> bool:
+    """
+    Restore DB from backup even if DB file exists.
+    Also remove WAL/SHM files to prevent replaying corrupt pages.
+    """
+    try:
+        if not os.path.exists(BACKUP_FILE):
+            return False
+        for suffix in ("-wal", "-shm"):
+            try:
+                p = DB_FILE + suffix
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        shutil.copy(BACKUP_FILE, DB_FILE)
+        return True
+    except Exception:
+        return False
 
 
 # =======================
@@ -166,6 +204,11 @@ async def db_connect() -> aiosqlite.Connection:
 def _is_db_locked_error(err: Exception) -> bool:
     msg = str(err).lower()
     return "database is locked" in msg or "database schema is locked" in msg or "database table is locked" in msg
+
+
+def _is_db_malformed_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "database disk image is malformed" in msg or "malformed" in msg
 
 
 async def _db_execute_with_retry(conn: aiosqlite.Connection, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Cursor:
@@ -188,14 +231,27 @@ async def db_conn() -> aiosqlite.Connection:
     NOTE: Do NOT use `async with await db_connect()`; that can double-start the aiosqlite thread.
     Always use `async with db_conn()` instead.
     """
-    conn = await db_connect()
-    try:
-        yield conn
-    finally:
+    conn = None
+    recovered = False
+    while True:
+        conn = await db_connect()
         try:
-            await conn.close()
-        except Exception:
-            pass
+            yield conn
+            break
+        except Exception as e:
+            if (not recovered) and _is_db_malformed_error(e) and _restore_db_force():
+                recovered = True
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+                continue
+            raise
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
 
 
 async def _add_column_if_missing(conn: aiosqlite.Connection, table: str, column: str, col_type: str) -> None:

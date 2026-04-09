@@ -1786,13 +1786,26 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sid = _parse_int_param(data, "s")
         lid = _parse_int_param(data, "id")
         if sid is None or lid is None:
+            await query.message.reply_text("⚠️ بيانات غير صالحة لتنفيذ الحذف.", reply_markup=admin_panel_keyboard())
             return
-        async with db_conn() as conn:
-            await _db_execute_with_retry(conn, "DELETE FROM favorites WHERE lecture_id=?", (lid,))
-            await _db_execute_with_retry(conn, "DELETE FROM lectures WHERE id=? AND subject_id=?", (lid, sid))
-            await conn.commit()
-        save_db()
-        await query.message.reply_text("✅ تم حذف المحاضرة.", reply_markup=admin_panel_keyboard())
+        try:
+            async with db_conn() as conn:
+                async with conn.execute(
+                    "SELECT title FROM lectures WHERE id=? AND subject_id=?",
+                    (lid, sid),
+                ) as cur:
+                    row = await cur.fetchone()
+                if not row:
+                    await query.message.reply_text("⚠️ هذه المحاضرة غير موجودة أو تم حذفها بالفعل.", reply_markup=admin_panel_keyboard())
+                    return
+                await _db_execute_with_retry(conn, "DELETE FROM favorites WHERE lecture_id=?", (lid,))
+                await _db_execute_with_retry(conn, "DELETE FROM lectures WHERE id=? AND subject_id=?", (lid, sid))
+                await conn.commit()
+            save_db()
+            await query.message.reply_text("✅ تم حذف المحاضرة.", reply_markup=admin_panel_keyboard())
+        except Exception as e:
+            LOG.exception("فشل تأكيد حذف المحاضرة", exc_info=e)
+            await query.message.reply_text("⚠️ حدث خطأ أثناء حذف المحاضرة. حاول مرة أخرى.", reply_markup=admin_panel_keyboard())
         return
 
     # ---- Edit subject name ----

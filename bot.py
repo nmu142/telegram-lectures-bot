@@ -1805,7 +1805,15 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text("✅ تم حذف المحاضرة.", reply_markup=admin_panel_keyboard())
         except Exception as e:
             LOG.exception("فشل تأكيد حذف المحاضرة", exc_info=e)
-            await query.message.reply_text("⚠️ حدث خطأ أثناء حذف المحاضرة. حاول مرة أخرى.", reply_markup=admin_panel_keyboard())
+            # Admin-only: include short error text to speed up debugging.
+            err_txt = str(e).strip().replace("\n", " ")
+            if len(err_txt) > 180:
+                err_txt = err_txt[:180] + "..."
+            await query.message.reply_text(
+                "⚠️ حدث خطأ أثناء حذف المحاضرة. حاول مرة أخرى.\n"
+                f"🔎 السبب: {err_txt or 'غير معروف'}",
+                reply_markup=admin_panel_keyboard(),
+            )
         return
 
     # ---- Edit subject name ----

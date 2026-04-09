@@ -14,7 +14,7 @@ from typing import Any, Optional
 import aiosqlite
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import RetryAfter, TimedOut, NetworkError
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,7 +29,7 @@ from telegram.ext import (
 
 TOKEN = os.getenv("TOKEN", "").strip()
 if not TOKEN:
-    raise RuntimeError("TOKEN env var is required")
+    raise RuntimeError("متغير البيئة TOKEN مطلوب لتشغيل البوت")
 
 MAIN_ADMIN_ID = int(os.getenv("MAIN_ADMIN_ID", "8377544927"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "El8awy116")
@@ -62,6 +62,10 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 UPLOAD_SESSION_TIMEOUT_S = int(os.getenv("UPLOAD_SESSION_TIMEOUT_S", str(20 * 60)))
 UPLOAD_PROGRESS_EDIT_EVERY_S = float(os.getenv("UPLOAD_PROGRESS_EDIT_EVERY_S", "2.5"))
 LIST_LOADING_EDIT = True
+ANTI_DOUBLE_CLICK_WINDOW_S = float(os.getenv("ANTI_DOUBLE_CLICK_WINDOW_S", "0.8"))
+DB_BUSY_TIMEOUT_MS = int(os.getenv("DB_BUSY_TIMEOUT_MS", "8000"))
+AUTO_RESTART_MAX_RETRIES = int(os.getenv("AUTO_RESTART_MAX_RETRIES", "0"))  # 0 = infinite
+AUTO_RESTART_BASE_DELAY_S = float(os.getenv("AUTO_RESTART_BASE_DELAY_S", "1.5"))
 
 # =======================
 # LOG SYSTEM
@@ -69,11 +73,42 @@ LIST_LOADING_EDIT = True
 LOG = logging.getLogger("lectures_bot")
 
 
+async def safe_answer(query) -> None:
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+
+async def safe_edit(message, text: str, reply_markup=None) -> bool:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+        return True
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return True
+        return False
+    except Exception:
+        return False
+
+
+async def safe_bot_edit_text(bot, *, chat_id: int, message_id: int, text: str, reply_markup=None) -> bool:
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+        return True
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def log_admin_action(user_id: int, action: str) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         with open("admin_log.txt", "a", encoding="utf-8") as f:
-            f.write(f"[{now}] Admin({user_id}) -> {action}\n")
+            f.write(f"[{now}] أدمن({user_id}) -> {action}\n")
     except Exception:
         pass
 
@@ -103,12 +138,30 @@ def restore_db() -> None:
 
 
 async def db_connect() -> aiosqlite.Connection:
-    conn = await aiosqlite.connect(DB_FILE)
+    conn = await aiosqlite.connect(DB_FILE, timeout=max(1.0, DB_BUSY_TIMEOUT_MS / 1000.0))
     await conn.execute("PRAGMA journal_mode=WAL")
     await conn.execute("PRAGMA synchronous=NORMAL")
     await conn.execute("PRAGMA foreign_keys=ON")
+    await conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     conn.row_factory = aiosqlite.Row
     return conn
+
+
+def _is_db_locked_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "database is locked" in msg or "database schema is locked" in msg or "database table is locked" in msg
+
+
+async def _db_execute_with_retry(conn: aiosqlite.Connection, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Cursor:
+    delay = 0.15
+    for attempt in range(6):
+        try:
+            return await conn.execute(sql, params)
+        except Exception as e:
+            if not _is_db_locked_error(e) or attempt == 5:
+                raise
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.6, 1.2)
 
 
 @asynccontextmanager
@@ -268,7 +321,7 @@ async def init_db() -> None:
         async with conn.execute("SELECT COUNT(*) AS c FROM lectures_fts") as cur_fts:
             fts_count = int((await cur_fts.fetchone())["c"])
         if fts_count == 0:
-            await conn.execute("INSERT INTO lectures_fts(rowid, title) SELECT id, title FROM lectures")
+            await _db_execute_with_retry(conn, "INSERT INTO lectures_fts(rowid, title) SELECT id, title FROM lectures", ())
 
         now = int(time.time())
         await conn.execute(
@@ -476,24 +529,24 @@ def main_menu() -> InlineKeyboardMarkup:
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     buttons = [
-        btn("➕📚 Add subject", "a:add_subject"),
-        btn("➕📄 Add lecture", "a:add_lecture"),
-        btn("📥📁 Import folder", "a:import_folder"),
-        btn("📥🗂 Import batch", "a:import_batch"),
-        btn("🗑️📚 Delete subject", "a:delete_subject"),
-        btn("🗑️📄 Delete lecture", "a:delete_lecture"),
-        btn("✏️📚 Edit subject", "a:edit_subject"),
-        btn("✏️📄 Edit lecture", "a:edit_lecture"),
-        btn("↕️📚 Sort subjects", "a:sort_subjects"),
-        btn("🔗 Manage links", "a:manage_links"),
-        btn("📢 Broadcast", "a:broadcast"),
-        btn("📊 Statistics", "a:stats"),
-        btn("💾 Backup DB", "a:backup"),
-        btn("🧹 Clean data", "a:clean"),
-        btn("⛔ Stop bot", "a:stop"),
-        btn("✅ Start bot", "a:start"),
-        btn("👮 Manage admins", "a:manage_admins"),
-        btn("⬅️ Back to admin", "a:panel"),
+        btn("➕📚 إضافة مادة", "a:add_subject"),
+        btn("➕📄 إضافة محاضرة", "a:add_lecture"),
+        btn("📥📁 استيراد مجلد", "a:import_folder"),
+        btn("📥🗂 استيراد دفعة", "a:import_batch"),
+        btn("🗑️📚 حذف مادة", "a:delete_subject"),
+        btn("🗑️📄 حذف محاضرة", "a:delete_lecture"),
+        btn("✏️📚 تعديل مادة", "a:edit_subject"),
+        btn("✏️📄 تعديل محاضرة", "a:edit_lecture"),
+        btn("↕️📚 ترتيب المواد", "a:sort_subjects"),
+        btn("🔗 إدارة الروابط", "a:manage_links"),
+        btn("📢 إذاعة", "a:broadcast"),
+        btn("📊 إحصائيات", "a:stats"),
+        btn("💾 نسخ احتياطي", "a:backup"),
+        btn("🧹 تنظيف البيانات", "a:clean"),
+        btn("⛔ إيقاف البوت", "a:stop"),
+        btn("✅ تشغيل البوت", "a:start"),
+        btn("👮 إدارة الأدمنز", "a:manage_admins"),
+        btn("⬅️ الرجوع للأدمن", "a:panel"),
     ]
     rows = grid_2col(buttons)
     rows.append(nav_row(show_back=False, show_home=True))
@@ -569,7 +622,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     if not query or not query.from_user:
         return
-    await query.answer()
+    await safe_answer(query)
 
     limiter: RateLimiter = context.application.bot_data["limiter"]
     uid = query.from_user.id
@@ -582,6 +635,21 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     data = query.data or ""
+
+    # Anti double-click (same callback quickly)
+    try:
+        now = time.time()
+        last = context.user_data.get("_last_cb")
+        if isinstance(last, dict) and last.get("d") == data and (now - float(last.get("t", 0.0))) < ANTI_DOUBLE_CLICK_WINDOW_S:
+            return
+        context.user_data["_last_cb"] = {"d": data, "t": now}
+    except Exception:
+        pass
+    # Log user button clicks for debugging
+    try:
+        LOG.info("ضغط_زر_مستخدم %s %s", uid, data)
+    except Exception:
+        pass
 
     if data == "u:home":
         nav_clear(context)
@@ -646,12 +714,13 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ) as cur:
                 exists = await cur.fetchone()
             if exists:
-                await conn.execute("DELETE FROM favorites WHERE user_id=? AND lecture_id=?", (uid, lid))
+                await _db_execute_with_retry(conn, "DELETE FROM favorites WHERE user_id=? AND lecture_id=?", (uid, lid))
                 await conn.commit()
                 save_db()
                 await query.message.reply_text("✅ تم الإزالة من المفضلة.", reply_markup=markup([nav_row()]))
             else:
-                await conn.execute(
+                await _db_execute_with_retry(
+                    conn,
                     "INSERT OR IGNORE INTO favorites(user_id, lecture_id, created_at) VALUES(?,?,?)",
                     (uid, lid, now),
                 )
@@ -761,7 +830,7 @@ async def show_subjects(query, page: int) -> None:
     if not rows:
         if loading_msg:
             try:
-                await loading_msg.edit_text("📌 لا توجد مواد بعد.")
+                await safe_edit(loading_msg, "📌 لا توجد مواد بعد.")
             except Exception:
                 await query.message.reply_text("📌 لا توجد مواد بعد.", reply_markup=markup([nav_row()]))
         else:
@@ -777,7 +846,7 @@ async def show_subjects(query, page: int) -> None:
     keyboard.append(nav_row())
     if loading_msg:
         try:
-            await loading_msg.edit_text("📚 اختر المادة:", reply_markup=markup(keyboard))
+            await safe_edit(loading_msg, "📚 اختر المادة:", reply_markup=markup(keyboard))
         except Exception:
             await query.message.reply_text("📚 اختر المادة:", reply_markup=markup(keyboard))
     else:
@@ -809,7 +878,7 @@ async def show_lectures(query, subject_id: int, page: int) -> None:
     if not rows:
         if loading_msg:
             try:
-                await loading_msg.edit_text("📌 لا توجد محاضرات بعد.", reply_markup=markup([nav_row()]))
+                await safe_edit(loading_msg, "📌 لا توجد محاضرات بعد.", reply_markup=markup([nav_row()]))
             except Exception:
                 await query.message.reply_text("📌 لا توجد محاضرات بعد.", reply_markup=markup([nav_row()]))
         else:
@@ -832,7 +901,7 @@ async def show_lectures(query, subject_id: int, page: int) -> None:
     keyboard.append(nav_row())
     if loading_msg:
         try:
-            await loading_msg.edit_text("📘 المحاضرات:", reply_markup=markup(keyboard))
+            await safe_edit(loading_msg, "📘 المحاضرات:", reply_markup=markup(keyboard))
         except Exception:
             await query.message.reply_text("📘 المحاضرات:", reply_markup=markup(keyboard))
     else:
@@ -998,7 +1067,11 @@ async def _ensure_manual_order_subjects() -> None:
             if c and int(c["c"]) == 0:
                 return
         for i, r in enumerate(rows, start=1):
-            await conn.execute("UPDATE subjects SET manual_order=COALESCE(manual_order, ?) WHERE id=?", (i, r["id"]))
+            await _db_execute_with_retry(
+                conn,
+                "UPDATE subjects SET manual_order=COALESCE(manual_order, ?) WHERE id=?",
+                (i, r["id"]),
+            )
         await conn.commit()
 
 
@@ -1050,9 +1123,9 @@ async def _swap_subject_order(subject_id: int, direction: str) -> None:
         b_id = ids[swap_idx]
         a_ord = int(rows[idx]["manual_order"] or idx + 1)
         b_ord = int(rows[swap_idx]["manual_order"] or swap_idx + 1)
-        await conn.execute("BEGIN")
-        await conn.execute("UPDATE subjects SET manual_order=? WHERE id=?", (b_ord, a_id))
-        await conn.execute("UPDATE subjects SET manual_order=? WHERE id=?", (a_ord, b_id))
+        await _db_execute_with_retry(conn, "BEGIN", ())
+        await _db_execute_with_retry(conn, "UPDATE subjects SET manual_order=? WHERE id=?", (b_ord, a_id))
+        await _db_execute_with_retry(conn, "UPDATE subjects SET manual_order=? WHERE id=?", (a_ord, b_id))
         await conn.commit()
 
 
@@ -1077,9 +1150,17 @@ async def _swap_lecture_order(subject_id: int, lecture_id: int, direction: str) 
         b_id = ids[swap_idx]
         a_ord = int(rows[idx]["manual_order"] or idx + 1)
         b_ord = int(rows[swap_idx]["manual_order"] or swap_idx + 1)
-        await conn.execute("BEGIN")
-        await conn.execute("UPDATE lectures SET manual_order=? WHERE id=? AND subject_id=?", (b_ord, a_id, subject_id))
-        await conn.execute("UPDATE lectures SET manual_order=? WHERE id=? AND subject_id=?", (a_ord, b_id, subject_id))
+        await _db_execute_with_retry(conn, "BEGIN", ())
+        await _db_execute_with_retry(
+            conn,
+            "UPDATE lectures SET manual_order=? WHERE id=? AND subject_id=?",
+            (b_ord, a_id, subject_id),
+        )
+        await _db_execute_with_retry(
+            conn,
+            "UPDATE lectures SET manual_order=? WHERE id=? AND subject_id=?",
+            (a_ord, b_id, subject_id),
+        )
         await conn.commit()
 
 
@@ -1168,26 +1249,48 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if not await is_admin(update.effective_user.id):
         return
-    await update.message.reply_text("🛠 لوحة التحكم (Admin)", reply_markup=admin_panel_keyboard())
+    await update.message.reply_text("🛠 لوحة التحكم", reply_markup=admin_panel_keyboard())
 
 
 async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.from_user:
         return
-    await query.answer()
+    await safe_answer(query)
     global BOT_ENABLED
     uid = query.from_user.id
     if not await is_admin(uid):
         return
+
+    # Rate-limit admin callbacks too (prevents floods)
+    limiter: RateLimiter = context.application.bot_data["limiter"]
+    if not limiter.check(uid):
+        await query.message.reply_text(RATE_LIMIT_MESSAGE)
+        return
+
+    # Anti double-click (same callback quickly)
+    try:
+        now = time.time()
+        last = context.user_data.get("_last_cb_admin")
+        d = query.data or ""
+        if isinstance(last, dict) and last.get("d") == d and (now - float(last.get("t", 0.0))) < ANTI_DOUBLE_CLICK_WINDOW_S:
+            return
+        context.user_data["_last_cb_admin"] = {"d": d, "t": now}
+    except Exception:
+        pass
 
     if cleanup_expired_upload_session(context):
         await query.message.reply_text("⌛ انتهت جلسة الرفع. ابدأ من لوحة الأدمن مرة أخرى.", reply_markup=admin_panel_keyboard())
         return
 
     data = query.data or ""
+    # Log admin button click for debugging
+    try:
+        log_admin_action(uid, f"ضغط_زر {data}")
+    except Exception:
+        pass
     if data in ("a:panel",):
-        await query.message.reply_text("🛠 لوحة التحكم (Admin)", reply_markup=admin_panel_keyboard())
+        await query.message.reply_text("🛠 لوحة التحكم", reply_markup=admin_panel_keyboard())
         return
 
     if data == "a:add_subject":
@@ -1216,7 +1319,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Create a single progress message that we keep editing
         try:
             m = await query.message.reply_text(
-                "📦 رفع المحاضرات بدأ...\n✅ Saved: 0\n⚠️ Failed: 0\n\n📤 ارفع الملفات الآن (أي نوع).\nاضغط ✅ تم عند الانتهاء.",
+                "📦 بدأ رفع المحاضرات...\n✅ تم الحفظ: 0\n⚠️ فشل: 0\n\n📤 ارفع الملفات الآن (أي نوع).\nاضغط ✅ تم عند الانتهاء.",
                 reply_markup=markup([[btn("✅ تم", "a:upload_done")], admin_nav_row()]),
             )
             session.progress_chat_id = m.chat_id
@@ -1229,7 +1332,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "a:import_folder":
         context.user_data["admin_mode"] = "import_folder_ask_subject"
         await query.message.reply_text(
-            "📥📁 Import folder\nاكتب اسم المادة وسيتم إنشاؤها تلقائيًا ثم ارفع ملفات متعددة.",
+            "📥📁 استيراد مجلد\nاكتب اسم المادة وسيتم إنشاؤها تلقائيًا ثم ارفع ملفات متعددة.",
             reply_markup=markup([admin_nav_row()]),
         )
         return
@@ -1253,7 +1356,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         set_upload_session(context, session)
         try:
             m = await query.message.reply_text(
-                "📦 رفع batch بدأ...\n✅ Saved: 0\n⚠️ Failed: 0\n\n📤 ارفع الملفات الآن.\nاضغط ✅ تم عند الانتهاء.",
+                "📦 بدأ رفع الدفعة...\n✅ تم الحفظ: 0\n⚠️ فشل: 0\n\n📤 ارفع الملفات الآن.\nاضغط ✅ تم عند الانتهاء.",
                 reply_markup=markup([[btn("✅ تم", "a:upload_done")], admin_nav_row()]),
             )
             session.progress_chat_id = m.chat_id
@@ -1268,11 +1371,12 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         counters = context.user_data.get("upload_counters") if isinstance(context.user_data.get("upload_counters"), dict) else {}
         set_upload_session(context, None)
         context.user_data.pop("admin_mode", None)
-        summary = f"✅ تم إنهاء الرفع.\n✅ Saved: {int(counters.get('saved', 0))}\n⚠️ Failed: {int(counters.get('failed', 0))}"
+        summary = f"✅ تم إنهاء الرفع.\n✅ تم الحفظ: {int(counters.get('saved', 0))}\n⚠️ فشل: {int(counters.get('failed', 0))}"
         # Try to edit the single progress message if it exists
         if session and session.progress_chat_id and session.progress_message_id:
             try:
-                await context.bot.edit_message_text(
+                await safe_bot_edit_text(
+                    context.bot,
                     chat_id=session.progress_chat_id,
                     message_id=session.progress_message_id,
                     text=summary,
@@ -1306,8 +1410,8 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if sid is None:
             return
         async with db_conn() as conn:
-            await conn.execute("DELETE FROM lectures WHERE subject_id=?", (sid,))
-            await conn.execute("DELETE FROM subjects WHERE id=?", (sid,))
+            await _db_execute_with_retry(conn, "DELETE FROM lectures WHERE subject_id=?", (sid,))
+            await _db_execute_with_retry(conn, "DELETE FROM subjects WHERE id=?", (sid,))
             await conn.commit()
         save_db()
         await query.message.reply_text("✅ تم حذف المادة.", reply_markup=admin_panel_keyboard())
@@ -1350,8 +1454,8 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if sid is None or lid is None:
             return
         async with db_conn() as conn:
-            await conn.execute("DELETE FROM favorites WHERE lecture_id=?", (lid,))
-            await conn.execute("DELETE FROM lectures WHERE id=? AND subject_id=?", (lid, sid))
+            await _db_execute_with_retry(conn, "DELETE FROM favorites WHERE lecture_id=?", (lid,))
+            await _db_execute_with_retry(conn, "DELETE FROM lectures WHERE id=? AND subject_id=?", (lid, sid))
             await conn.commit()
         save_db()
         await query.message.reply_text("✅ تم حذف المحاضرة.", reply_markup=admin_panel_keyboard())
@@ -1435,8 +1539,8 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         lid = _parse_int_param(data, "id")
         if lid is None:
             return
-        async with await db_connect() as conn:
-            await conn.execute("DELETE FROM important_links WHERE id=?", (lid,))
+        async with db_conn() as conn:
+            await _db_execute_with_retry(conn, "DELETE FROM important_links WHERE id=?", (lid,))
             await conn.commit()
         save_db()
         await query.message.reply_text("✅ تم حذف اللينك.", reply_markup=admin_panel_keyboard())
@@ -1450,11 +1554,9 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # ---- Clean data ----
     if data == "a:clean":
-        async with await db_connect() as conn:
+        async with db_conn() as conn:
             # remove favorites pointing to missing lectures
-            await conn.execute(
-                "DELETE FROM favorites WHERE lecture_id NOT IN (SELECT id FROM lectures)"
-            )
+            await _db_execute_with_retry(conn, "DELETE FROM favorites WHERE lecture_id NOT IN (SELECT id FROM lectures)", ())
             await conn.commit()
         save_db()
         await query.message.reply_text("🧹 تم تنظيف البيانات الأساسية.", reply_markup=admin_panel_keyboard())
@@ -1475,8 +1577,8 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if aid == MAIN_ADMIN_ID:
             await query.message.reply_text("⚠️ لا يمكن حذف الأدمن الرئيسي.", reply_markup=admin_panel_keyboard())
             return
-        async with await db_connect() as conn:
-            await conn.execute("DELETE FROM admins WHERE user_id=?", (aid,))
+        async with db_conn() as conn:
+            await _db_execute_with_retry(conn, "DELETE FROM admins WHERE user_id=?", (aid,))
             await conn.commit()
         save_db()
         await query.message.reply_text("✅ تم حذف الأدمن.", reply_markup=admin_panel_keyboard())
@@ -1488,11 +1590,11 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "a:backup":
         save_db()
-        await query.message.reply_text("✅ تم عمل نسخة احتياطية للقاعدة.", reply_markup=admin_panel_keyboard())
+        await query.message.reply_text("✅ تم إنشاء نسخة احتياطية لقاعدة البيانات.", reply_markup=admin_panel_keyboard())
         return
 
     if data == "a:stats":
-        async with await db_connect() as conn:
+        async with db_conn() as conn:
             async with conn.execute("SELECT COUNT(*) AS c FROM users") as cur1:
                 users_c = int((await cur1.fetchone())["c"])
             async with conn.execute("SELECT COUNT(*) AS c FROM subjects") as cur2:
@@ -1502,23 +1604,23 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             async with conn.execute("SELECT COUNT(*) AS c FROM uploads") as cur4:
                 up_c = int((await cur4.fetchone())["c"])
         await query.message.reply_text(
-            "📊 Statistics\n"
-            f"👥 Users: {users_c}\n"
-            f"📚 Subjects: {sub_c}\n"
-            f"📄 Lectures: {lec_c}\n"
-            f"📤 Uploads: {up_c}",
+            "📊 الإحصائيات\n"
+            f"👥 عدد المستخدمين: {users_c}\n"
+            f"📚 عدد المواد: {sub_c}\n"
+            f"📄 عدد المحاضرات: {lec_c}\n"
+            f"📤 عدد الرفعات: {up_c}",
             reply_markup=admin_panel_keyboard(),
         )
         return
 
     if data == "a:stop":
         BOT_ENABLED = False
-        await query.message.reply_text("⛔ تم إيقاف البوت للمستخدمين (وضع صيانة).", reply_markup=admin_panel_keyboard())
+        await query.message.reply_text("⛔ تم تفعيل وضع الصيانة (المستخدمون لن يتمكنوا من استخدام البوت).", reply_markup=admin_panel_keyboard())
         return
 
     if data == "a:start":
         BOT_ENABLED = True
-        await query.message.reply_text("✅ تم تشغيل البوت للمستخدمين.", reply_markup=admin_panel_keyboard())
+        await query.message.reply_text("✅ تم إلغاء وضع الصيانة وتشغيل البوت للمستخدمين.", reply_markup=admin_panel_keyboard())
         return
 
     # ---- Sorting (manual reorder) ----
@@ -1557,7 +1659,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # required buttons exist; wiring/logic will be implemented in next steps
-    await query.message.reply_text("⏳ قيد التطوير الآن…", reply_markup=markup([admin_nav_row()]))
+    await query.message.reply_text("⚠️ أمر غير معروف أو غير مدعوم حاليًا.", reply_markup=markup([admin_nav_row()]))
 
 
 async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1574,12 +1676,9 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if mode == "add_subject":
         now = int(time.time())
-        async with await db_connect() as conn:
+        async with db_conn() as conn:
             try:
-                await conn.execute(
-                    "INSERT INTO subjects(name, created_at) VALUES(?, ?)",
-                    (text, now),
-                )
+                await _db_execute_with_retry(conn, "INSERT INTO subjects(name, created_at) VALUES(?, ?)", (text, now))
                 await conn.commit()
             except Exception:
                 await update.message.reply_text("⚠️ لم أستطع إضافة المادة (قد تكون موجودة بالفعل).")
@@ -1592,12 +1691,9 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if mode == "import_folder_ask_subject":
         subject_name = text
         now = int(time.time())
-        async with await db_connect() as conn:
+        async with db_conn() as conn:
             # create subject if missing
-            await conn.execute(
-                "INSERT OR IGNORE INTO subjects(name, created_at) VALUES(?, ?)",
-                (subject_name, now),
-            )
+            await _db_execute_with_retry(conn, "INSERT OR IGNORE INTO subjects(name, created_at) VALUES(?, ?)", (subject_name, now))
             await conn.commit()
             async with conn.execute("SELECT id FROM subjects WHERE name=?", (subject_name,)) as cur:
                 row = await cur.fetchone()
@@ -1612,7 +1708,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         save_db()
         try:
             m = await update.message.reply_text(
-                f"✅ تم تجهيز المادة: {subject_name}\n\n📦 رفع الملفات بدأ...\n✅ Saved: 0\n⚠️ Failed: 0\n\n📤 ارفع الملفات الآن.\nاضغط ✅ تم عند الانتهاء.",
+                f"✅ تم تجهيز المادة: {subject_name}\n\n📦 بدأ رفع الملفات...\n✅ تم الحفظ: 0\n⚠️ فشل: 0\n\n📤 ارفع الملفات الآن.\nاضغط ✅ تم عند الانتهاء.",
                 reply_markup=markup([[btn("✅ تم", "a:upload_done")], admin_nav_row()]),
             )
             session.progress_chat_id = m.chat_id
@@ -1628,9 +1724,9 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         sid = context.user_data.get("edit_subject_id")
         if not isinstance(sid, int):
             return
-        async with await db_connect() as conn:
+        async with db_conn() as conn:
             try:
-                await conn.execute("UPDATE subjects SET name=? WHERE id=?", (text, sid))
+                await _db_execute_with_retry(conn, "UPDATE subjects SET name=? WHERE id=?", (text, sid))
                 await conn.commit()
             except Exception:
                 await update.message.reply_text("⚠️ لم أستطع تعديل الاسم (قد يكون موجود).")
@@ -1647,7 +1743,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if not isinstance(sid, int) or not isinstance(lid, int):
             return
         # Duplicate protection (per-subject) for edited titles
-        async with await db_connect() as conn:
+        async with db_conn() as conn:
             async with conn.execute(
                 "SELECT 1 FROM lectures WHERE subject_id=? AND title=? AND id<>?",
                 (sid, text, lid),
@@ -1667,10 +1763,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                             new_title = cand
                             break
                     i += 1
-            await conn.execute(
-                "UPDATE lectures SET title=? WHERE id=? AND subject_id=?",
-                (new_title, lid, sid),
-            )
+            await _db_execute_with_retry(conn, "UPDATE lectures SET title=? WHERE id=? AND subject_id=?", (new_title, lid, sid))
             await conn.commit()
         save_db()
         context.user_data.pop("admin_mode", None)
@@ -1690,8 +1783,9 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         url = text
         if not isinstance(title, str) or not url:
             return
-        async with await db_connect() as conn:
-            await conn.execute(
+        async with db_conn() as conn:
+            await _db_execute_with_retry(
+                conn,
                 "INSERT INTO important_links(title, url, position) VALUES(?,?,?)",
                 (title, url, 999),
             )
@@ -1704,11 +1798,11 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if mode == "broadcast_text":
         msg = text
-        async with await db_connect() as conn:
+        async with db_conn() as conn:
             async with conn.execute("SELECT user_id FROM users") as cur:
                 users = [int(r["user_id"]) for r in await cur.fetchall()]
 
-        progress = await update.message.reply_text("⏳ جاري إرسال البرودكاست...", reply_markup=admin_panel_keyboard())
+        progress = await update.message.reply_text("⏳ جاري إرسال الإذاعة...", reply_markup=admin_panel_keyboard())
 
         sent = 0
         failed = 0
@@ -1736,15 +1830,16 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             batch = users[i : i + batch_size]
             await asyncio.gather(*[_send_one(uid) for uid in batch])
             try:
-                await progress.edit_text(
-                    f"📢 Broadcast progress\n📨 Sent: {sent}\n⚠️ Failed: {failed}\n👥 Total: {len(users)}"
+                await safe_edit(
+                    progress,
+                    f"📢 تقدم الإذاعة\n📨 تم الإرسال: {sent}\n⚠️ فشل: {failed}\n👥 الإجمالي: {len(users)}",
                 )
             except Exception:
                 pass
             await asyncio.sleep(0.2)
 
         await update.message.reply_text(
-            f"✅ Broadcast done.\n📨 Sent: {sent}\n⚠️ Failed: {failed}\n👥 Total: {len(users)}",
+            f"✅ تمت الإذاعة.\n📨 تم الإرسال: {sent}\n⚠️ فشل: {failed}\n👥 الإجمالي: {len(users)}",
             reply_markup=admin_panel_keyboard(),
         )
         context.user_data.pop("admin_mode", None)
@@ -1761,7 +1856,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             context.user_data.pop("admin_mode", None)
             return
         async with await db_connect() as conn:
-            await conn.execute("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (new_id,))
+            await _db_execute_with_retry(conn, "INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (new_id,))
             await conn.commit()
         save_db()
         context.user_data.pop("admin_mode", None)
@@ -1829,7 +1924,7 @@ async def _admin_choose_subject_for_upload(query, page: int, cb_base: str) -> No
     if not rows:
         if loading_msg:
             try:
-                await loading_msg.edit_text("📌 لا توجد مواد بعد.")
+                await safe_edit(loading_msg, "📌 لا توجد مواد بعد.")
             except Exception:
                 await query.message.reply_text("📌 لا توجد مواد بعد.", reply_markup=admin_panel_keyboard())
         else:
@@ -1844,7 +1939,7 @@ async def _admin_choose_subject_for_upload(query, page: int, cb_base: str) -> No
     keyboard.append(admin_nav_row())
     if loading_msg:
         try:
-            await loading_msg.edit_text("📚 اختر المادة:", reply_markup=markup(keyboard))
+            await safe_edit(loading_msg, "📚 اختر المادة:", reply_markup=markup(keyboard))
         except Exception:
             await query.message.reply_text("📚 اختر المادة:", reply_markup=markup(keyboard))
     else:
@@ -1879,7 +1974,7 @@ async def _admin_choose_lecture(query, subject_id: int, page: int, cb_base: str)
     if not rows:
         if loading_msg:
             try:
-                await loading_msg.edit_text("📌 لا توجد محاضرات.")
+                await safe_edit(loading_msg, "📌 لا توجد محاضرات.")
             except Exception:
                 await query.message.reply_text("📌 لا توجد محاضرات.", reply_markup=admin_panel_keyboard())
         else:
@@ -1895,7 +1990,7 @@ async def _admin_choose_lecture(query, subject_id: int, page: int, cb_base: str)
     keyboard.append(admin_nav_row())
     if loading_msg:
         try:
-            await loading_msg.edit_text("📄 اختر المحاضرة:", reply_markup=markup(keyboard))
+            await safe_edit(loading_msg, "📄 اختر المحاضرة:", reply_markup=markup(keyboard))
         except Exception:
             await query.message.reply_text("📄 اختر المحاضرة:", reply_markup=markup(keyboard))
     else:
@@ -1923,10 +2018,10 @@ async def _admin_show_links_manage(query, page: int) -> None:
         ) as cur:
             rows = await cur.fetchall()
     if not rows:
-        text = "🔗 Manage links\nلا توجد لينكات بعد."
+        text = "🔗 إدارة الروابط\nلا توجد روابط بعد."
         if loading_msg:
             try:
-                await loading_msg.edit_text(text, reply_markup=markup([[btn("➕ إضافة لينك", "a:links_add")], admin_nav_row()]))
+                await safe_edit(loading_msg, text, reply_markup=markup([[btn("➕ إضافة رابط", "a:links_add")], admin_nav_row()]))
             except Exception:
                 await query.message.reply_text(
                     text,
@@ -1941,8 +2036,8 @@ async def _admin_show_links_manage(query, page: int) -> None:
     has_next = len(rows) > PAGE_SIZE
     rows = rows[:PAGE_SIZE]
     keyboard: list[list[InlineKeyboardButton]] = []
-    keyboard.append([btn("➕ إضافة لينك", "a:links_add")])
-    keyboard.append([btn("↕️ تفعيل الترتيب اليدوي", "a:links_reorder_init")])
+    keyboard.append([btn("➕ إضافة رابط", "a:links_add")])
+    keyboard.append([btn("↕️ تهيئة الترتيب اليدوي", "a:links_reorder_init")])
     for r in rows:
         link_id = int(r["id"])
         keyboard.append(
@@ -1955,13 +2050,14 @@ async def _admin_show_links_manage(query, page: int) -> None:
         keyboard.append([btn("🗑️ حذف", f"a:links_del:id={link_id}")])
     keyboard.append(pagination_row(base_cb="a:manage_links", page=page, has_prev=page > 0, has_next=has_next))
     keyboard.append(admin_nav_row())
+    title = "🔗 إدارة الروابط:"
     if loading_msg:
         try:
-            await loading_msg.edit_text("🔗 Manage links:", reply_markup=markup(keyboard))
+            await safe_edit(loading_msg, title, reply_markup=markup(keyboard))
         except Exception:
-            await query.message.reply_text("🔗 Manage links:", reply_markup=markup(keyboard))
+            await query.message.reply_text(title, reply_markup=markup(keyboard))
     else:
-        await query.message.reply_text("🔗 Manage links:", reply_markup=markup(keyboard))
+        await query.message.reply_text(title, reply_markup=markup(keyboard))
 
 
 async def _ensure_links_positions() -> None:
@@ -1974,7 +2070,7 @@ async def _ensure_links_positions() -> None:
             return
         # Normalize positions to 1..n
         for i, r in enumerate(rows, start=1):
-            await conn.execute("UPDATE important_links SET position=? WHERE id=?", (i, int(r["id"])))
+            await _db_execute_with_retry(conn, "UPDATE important_links SET position=? WHERE id=?", (i, int(r["id"])))
         await conn.commit()
 
 
@@ -1998,9 +2094,9 @@ async def _swap_link_position(link_id: int, direction: str) -> None:
         b_id = ids[swap_idx]
         a_pos = int(rows[idx]["position"] or idx + 1)
         b_pos = int(rows[swap_idx]["position"] or swap_idx + 1)
-        await conn.execute("BEGIN")
-        await conn.execute("UPDATE important_links SET position=? WHERE id=?", (b_pos, a_id))
-        await conn.execute("UPDATE important_links SET position=? WHERE id=?", (a_pos, b_id))
+        await _db_execute_with_retry(conn, "BEGIN", ())
+        await _db_execute_with_retry(conn, "UPDATE important_links SET position=? WHERE id=?", (b_pos, a_id))
+        await _db_execute_with_retry(conn, "UPDATE important_links SET position=? WHERE id=?", (a_pos, b_id))
         await conn.commit()
 
 
@@ -2010,12 +2106,12 @@ async def _admin_show_admins(query) -> None:
             rows = await cur.fetchall()
     buttons: list[list[InlineKeyboardButton]] = []
     buttons.append([btn("➕ إضافة أدمن", "a:admins_add"), btn("🔎 بحث مستخدمين", "a:user_search")])
-    buttons.append([btn(f"👑 MAIN: {MAIN_ADMIN_ID}", "noop")])
+    buttons.append([btn(f"👑 الأدمن_الرئيسي: {MAIN_ADMIN_ID}", "noop")])
     for r in rows:
         uid = int(r["user_id"])
         buttons.append([btn(f"👮 {uid}", "noop"), btn("🗑️", f"a:admins_del:id={uid}")])
     buttons.append(admin_nav_row())
-    await query.message.reply_text("👮 Manage admins:", reply_markup=markup(buttons))
+    await query.message.reply_text("👮 إدارة الأدمنز:", reply_markup=markup(buttons))
 
 
 def _split_filename(name: str) -> tuple[str, str]:
@@ -2126,13 +2222,14 @@ async def admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if should_edit and session.progress_chat_id and session.progress_message_id:
         session.last_progress_edit_ts = now_ts
         try:
-            await context.bot.edit_message_text(
+            await safe_bot_edit_text(
+                context.bot,
                 chat_id=session.progress_chat_id,
                 message_id=session.progress_message_id,
                 text=(
                     "📦 جاري الرفع...\n"
-                    f"✅ Saved: {int(counters.get('saved', 0))}\n"
-                    f"⚠️ Failed: {int(counters.get('failed', 0))}\n\n"
+                    f"✅ تم الحفظ: {int(counters.get('saved', 0))}\n"
+                    f"⚠️ فشل: {int(counters.get('failed', 0))}\n\n"
                     "📤 ارفع المزيد من الملفات، أو اضغط ✅ تم."
                 ),
                 reply_markup=markup([[btn("✅ تم", "a:upload_done")], admin_nav_row()]),
@@ -2227,9 +2324,25 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     application.add_handler(MessageHandler(filters.Document.ALL, admin_document))
 
-    print("BOT STARTED")
-    LOG.info("Starting polling...")
-    application.run_polling()
+    print("✅ تم تشغيل البوت")
+    LOG.info("بدء الاستقبال (Polling)...")
+
+    # Auto-restart protection: if polling crashes, restart with backoff
+    retries = 0
+    delay = AUTO_RESTART_BASE_DELAY_S
+    while True:
+        try:
+            application.run_polling()
+            return
+        except KeyboardInterrupt:
+            return
+        except Exception:
+            LOG.exception("تعطل الاستقبال (Polling) وسيتم إعادة التشغيل تلقائيًا")
+            retries += 1
+            if AUTO_RESTART_MAX_RETRIES > 0 and retries > AUTO_RESTART_MAX_RETRIES:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 1.7, 30.0)
 
 
 if __name__ == "__main__":
@@ -2237,5 +2350,5 @@ if __name__ == "__main__":
         main()
     except Exception:
         logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-        LOG.exception("Startup failed")
+        LOG.exception("فشل تشغيل البوت")
         raise

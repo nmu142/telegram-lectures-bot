@@ -104,6 +104,26 @@ async def safe_bot_edit_text(bot, *, chat_id: int, message_id: int, text: str, r
         return False
 
 
+def schedule_task(context: ContextTypes.DEFAULT_TYPE, coro: Any, *, name: str) -> None:
+    try:
+        task = asyncio.create_task(coro, name=name)
+    except TypeError:
+        task = asyncio.create_task(coro)
+
+    def _done(t: asyncio.Task) -> None:
+        try:
+            exc = t.exception()
+            if exc:
+                LOG.exception("خلفية_مهمة_فشلت %s", name, exc_info=exc)
+        except Exception:
+            pass
+
+    try:
+        task.add_done_callback(_done)
+    except Exception:
+        pass
+
+
 def log_admin_action(user_id: int, action: str) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -647,7 +667,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pass
     # Log user button clicks for debugging
     try:
-        LOG.info("ضغط_زر_مستخدم %s %s", uid, data)
+        LOG.info("USER_CLICK: %s %s", uid, data)
     except Exception:
         pass
 
@@ -667,7 +687,9 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data.startswith("u:subjects"):
         nav_push(context, "u:home")
-        await show_subjects(query, page=_parse_page(data))
+        page = _parse_page(data)
+        loading = await query.message.reply_text("⏳ جاري تحميل المواد...")
+        schedule_task(context, _bg_show_subjects(loading, page), name="bg_show_subjects")
         return
 
     if data.startswith("u:lectures"):
@@ -675,62 +697,30 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if sid is None:
             return
         nav_push(context, "u:subjects:p=0")
-        await show_lectures(query, sid, page=_parse_page(data))
+        page = _parse_page(data)
+        loading = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
+        schedule_task(context, _bg_show_lectures(loading, sid, page), name="bg_show_lectures")
         return
 
     if data.startswith("u:lec:"):
         lid = _parse_int_param(data, "id")
         if lid is None:
             return
-        async with db_conn() as conn:
-            async with conn.execute("SELECT file_id, title FROM lectures WHERE id=?", (lid,)) as cur:
-                row = await cur.fetchone()
-            if not row:
-                await query.message.reply_text("⚠️ المحاضرة غير موجودة.", reply_markup=markup([nav_row()]))
-                return
-            async with conn.execute(
-                "SELECT 1 FROM favorites WHERE user_id=? AND lecture_id=?",
-                (uid, lid),
-            ) as cur2:
-                fav = await cur2.fetchone()
-        fav_text = "⭐ إزالة من المفضلة" if fav else "⭐ حفظ في المفضلة"
-        await query.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
-        await query.message.reply_document(
-            row["file_id"],
-            caption=f"📄 {row['title']}",
-            reply_markup=markup([[btn(fav_text, f"u:fav_toggle:id={lid}")], nav_row()]),
-        )
+        loading = await query.message.reply_text("⏳ جاري إرسال المحاضرة...")
+        schedule_task(context, _bg_send_lecture(loading, uid, lid), name="bg_send_lecture")
         return
 
     if data.startswith("u:fav_toggle:"):
         lid = _parse_int_param(data, "id")
         if lid is None:
             return
-        now = int(time.time())
-        async with db_conn() as conn:
-            async with conn.execute(
-                "SELECT 1 FROM favorites WHERE user_id=? AND lecture_id=?",
-                (uid, lid),
-            ) as cur:
-                exists = await cur.fetchone()
-            if exists:
-                await _db_execute_with_retry(conn, "DELETE FROM favorites WHERE user_id=? AND lecture_id=?", (uid, lid))
-                await conn.commit()
-                save_db()
-                await query.message.reply_text("✅ تم الإزالة من المفضلة.", reply_markup=markup([nav_row()]))
-            else:
-                await _db_execute_with_retry(
-                    conn,
-                    "INSERT OR IGNORE INTO favorites(user_id, lecture_id, created_at) VALUES(?,?,?)",
-                    (uid, lid, now),
-                )
-                await conn.commit()
-                save_db()
-                await query.message.reply_text("✅ تم الحفظ في المفضلة.", reply_markup=markup([nav_row()]))
+        loading = await query.message.reply_text("⏳ جاري التنفيذ...")
+        schedule_task(context, _bg_toggle_fav(loading, uid, lid), name="bg_toggle_fav")
         return
 
     if data.startswith("u:links"):
         nav_push(context, "u:home")
+        await query.message.reply_text("⏳ جاري التحميل...")
         await show_links(query, page=_parse_page(data))
         return
 
@@ -742,11 +732,13 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data == "u:latest":
         nav_push(context, "u:home")
+        await query.message.reply_text("⏳ جاري التحميل...")
         await show_latest(query)
         return
 
     if data.startswith("u:favorites"):
         nav_push(context, "u:home")
+        await query.message.reply_text("⏳ جاري التحميل...")
         await show_favorites(query, user_id=uid, page=_parse_page(data))
         return
 
@@ -759,8 +751,13 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if data.startswith("u:search_results"):
         q = context.user_data.get("last_search_query") or ""
         page = _parse_page(data)
+        await query.message.reply_text("⏳ جاري التحميل...")
         await show_search_results(query, query_text=str(q), page=page)
         return
+
+    # Fallback: unknown user/nav callback (never silent)
+    await query.message.reply_text("⚠️ هذا الزر غير متاح حاليًا", reply_markup=markup([nav_row()]))
+    return
 
 
 async def user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -907,6 +904,307 @@ async def show_lectures(query, subject_id: int, page: int) -> None:
     else:
         await query.message.reply_text("📘 المحاضرات:", reply_markup=markup(keyboard))
 
+
+async def _render_subjects_into(message, page: int) -> None:
+    PAGE_SIZE = 12
+    offset = page * PAGE_SIZE
+    async with db_conn() as conn:
+        async with conn.execute(
+            """
+            SELECT id, name
+            FROM subjects
+            ORDER BY COALESCE(manual_order, 999999999), created_at, id
+            LIMIT ? OFFSET ?
+            """,
+            (PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await safe_edit(message, "📌 لا توجد مواد بعد.", reply_markup=markup([nav_row()]))
+        return
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    buttons = [btn(f"📚 {r['name']}", f"u:lectures:s={r['id']}:p=0") for r in rows]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(pagination_row(base_cb="u:subjects", page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(nav_row())
+    await safe_edit(message, "📚 اختر المادة:", reply_markup=markup(keyboard))
+
+
+async def _render_lectures_into(message, subject_id: int, page: int) -> None:
+    PAGE_SIZE = 12
+    offset = page * PAGE_SIZE
+    async with db_conn() as conn:
+        async with conn.execute(
+            """
+            SELECT id, title
+            FROM lectures
+            WHERE subject_id=?
+            ORDER BY COALESCE(manual_order, 999999999), created_at, id
+            LIMIT ? OFFSET ?
+            """,
+            (subject_id, PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await safe_edit(message, "📌 لا توجد محاضرات بعد.", reply_markup=markup([nav_row()]))
+        return
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    buttons = [btn(f"📄 {r['title']}", f"u:lec:id={r['id']}") for r in rows]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(
+        pagination_row(
+            base_cb=f"u:lectures:s={subject_id}",
+            page=page,
+            has_prev=page > 0,
+            has_next=has_next,
+        )
+    )
+    keyboard.append(nav_row())
+    await safe_edit(message, "📘 المحاضرات:", reply_markup=markup(keyboard))
+
+
+async def _render_admin_subjects_into(message, page: int, cb_base: str) -> None:
+    PAGE_SIZE = 12
+    offset = page * PAGE_SIZE
+    async with db_conn() as conn:
+        async with conn.execute(
+            """
+            SELECT id, name
+            FROM subjects
+            ORDER BY COALESCE(manual_order, 999999999), created_at, id
+            LIMIT ? OFFSET ?
+            """,
+            (PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await safe_edit(message, "📌 لا توجد مواد بعد.", reply_markup=admin_panel_keyboard())
+        return
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    buttons = [btn(f"📚 {r['name']}", f"{cb_base}:subject={int(r['id'])}") for r in rows]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(pagination_row(base_cb=cb_base, page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(admin_nav_row())
+    await safe_edit(message, "📚 اختر المادة:", reply_markup=markup(keyboard))
+
+
+async def _render_admin_lectures_into(message, subject_id: int, page: int, cb_base: str) -> None:
+    PAGE_SIZE = 12
+    offset = page * PAGE_SIZE
+    async with db_conn() as conn:
+        async with conn.execute(
+            """
+            SELECT id, title
+            FROM lectures
+            WHERE subject_id=?
+            ORDER BY COALESCE(manual_order, 999999999), created_at, id
+            LIMIT ? OFFSET ?
+            """,
+            (subject_id, PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await safe_edit(message, "📌 لا توجد محاضرات.", reply_markup=admin_panel_keyboard())
+        return
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    buttons = [btn(f"📄 {r['title']}", f"{cb_base.replace('_list', '_pick')}:id={int(r['id'])}") for r in rows]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(pagination_row(base_cb=cb_base, page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(admin_nav_row())
+    await safe_edit(message, "📄 اختر المحاضرة:", reply_markup=markup(keyboard))
+
+
+async def _render_admin_links_into(message, page: int) -> None:
+    # Reuse existing builder by calling the function and converting to edit: simplest is to re-query here.
+    PAGE_SIZE = 10
+    offset = page * PAGE_SIZE
+    async with db_conn() as conn:
+        async with conn.execute(
+            """
+            SELECT id, title, url
+            FROM important_links
+            ORDER BY position, id
+            LIMIT ? OFFSET ?
+            """,
+            (PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await safe_edit(
+            message,
+            "🔗 إدارة الروابط\nلا توجد روابط بعد.",
+            reply_markup=markup([[btn("➕ إضافة رابط", "a:links_add")], admin_nav_row()]),
+        )
+        return
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.append([btn("➕ إضافة رابط", "a:links_add")])
+    keyboard.append([btn("↕️ تهيئة الترتيب اليدوي", "a:links_reorder_init")])
+    for r in rows:
+        link_id = int(r["id"])
+        keyboard.append(
+            [
+                btn("⬆️", f"a:links_move:id={link_id}:dir=up:p={page}"),
+                url_btn(f"🔗 {r['title']}", r["url"]),
+                btn("⬇️", f"a:links_move:id={link_id}:dir=down:p={page}"),
+            ]
+        )
+        keyboard.append([btn("🗑️ حذف", f"a:links_del:id={link_id}")])
+    keyboard.append(pagination_row(base_cb="a:manage_links", page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(admin_nav_row())
+    await safe_edit(message, "🔗 إدارة الروابط:", reply_markup=markup(keyboard))
+
+
+async def _render_admin_admins_into(message) -> None:
+    async with db_conn() as conn:
+        async with conn.execute("SELECT user_id FROM admins ORDER BY user_id") as cur:
+            rows = await cur.fetchall()
+    buttons: list[list[InlineKeyboardButton]] = []
+    buttons.append([btn("➕ إضافة أدمن", "a:admins_add"), btn("🔎 بحث مستخدمين", "a:user_search")])
+    buttons.append([btn(f"👑 الأدمن_الرئيسي: {MAIN_ADMIN_ID}", "noop")])
+    for r in rows:
+        uid = int(r["user_id"])
+        buttons.append([btn(f"👮 {uid}", "noop"), btn("🗑️", f"a:admins_del:id={uid}")])
+    buttons.append(admin_nav_row())
+    await safe_edit(message, "👮 إدارة الأدمنز:", reply_markup=markup(buttons))
+
+async def _bg_show_subjects(loading_msg, page: int) -> None:
+    try:
+        await _render_subjects_into(loading_msg, page)
+    except Exception as e:
+        LOG.exception("فشل تحميل المواد", exc_info=e)
+        await safe_edit(loading_msg, "⚠️ حدث خطأ أثناء تحميل المواد.")
+
+
+async def _bg_show_lectures(loading_msg, subject_id: int, page: int) -> None:
+    try:
+        await _render_lectures_into(loading_msg, subject_id, page)
+    except Exception as e:
+        LOG.exception("فشل تحميل المحاضرات", exc_info=e)
+        await safe_edit(loading_msg, "⚠️ حدث خطأ أثناء تحميل المحاضرات.")
+
+
+async def _bg_send_lecture(loading_msg, user_id: int, lecture_id: int) -> None:
+    try:
+        async with db_conn() as conn:
+            async with conn.execute("SELECT file_id, title FROM lectures WHERE id=?", (lecture_id,)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                await safe_edit(loading_msg, "⚠️ المحاضرة غير موجودة.")
+                return
+            async with conn.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND lecture_id=?",
+                (user_id, lecture_id),
+            ) as cur2:
+                fav = await cur2.fetchone()
+        fav_text = "⭐ إزالة من المفضلة" if fav else "⭐ حفظ في المفضلة"
+        try:
+            await loading_msg.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
+        except Exception:
+            pass
+        await loading_msg.reply_document(
+            row["file_id"],
+            caption=f"📄 {row['title']}",
+            reply_markup=markup([[btn(fav_text, f"u:fav_toggle:id={lecture_id}")], nav_row()]),
+        )
+        await safe_edit(loading_msg, "✅ تم إرسال المحاضرة.")
+    except Exception as e:
+        LOG.exception("فشل إرسال المحاضرة", exc_info=e)
+        await safe_edit(loading_msg, "⚠️ حدث خطأ أثناء إرسال المحاضرة.")
+
+
+async def _bg_toggle_fav(loading_msg, user_id: int, lecture_id: int) -> None:
+    try:
+        now = int(time.time())
+        async with db_conn() as conn:
+            async with conn.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND lecture_id=?",
+                (user_id, lecture_id),
+            ) as cur:
+                exists = await cur.fetchone()
+            if exists:
+                await _db_execute_with_retry(conn, "DELETE FROM favorites WHERE user_id=? AND lecture_id=?", (user_id, lecture_id))
+                await conn.commit()
+                save_db()
+                await safe_edit(loading_msg, "✅ تم الإزالة من المفضلة.", reply_markup=markup([nav_row()]))
+            else:
+                await _db_execute_with_retry(
+                    conn,
+                    "INSERT OR IGNORE INTO favorites(user_id, lecture_id, created_at) VALUES(?,?,?)",
+                    (user_id, lecture_id, now),
+                )
+                await conn.commit()
+                save_db()
+                await safe_edit(loading_msg, "✅ تم الحفظ في المفضلة.", reply_markup=markup([nav_row()]))
+    except Exception as e:
+        LOG.exception("فشل تعديل المفضلة", exc_info=e)
+        await safe_edit(loading_msg, "⚠️ حدث خطأ أثناء تنفيذ العملية.")
+
+
+async def _bg_admin_choose_subject(loading_msg, page: int, cb_base: str) -> None:
+    try:
+        await _render_admin_subjects_into(loading_msg, page, cb_base)
+    except Exception as e:
+        LOG.exception("فشل تحميل قائمة المواد للأدمن", exc_info=e)
+        await safe_edit(loading_msg, "⚠️ حدث خطأ أثناء تحميل المواد.")
+
+
+async def _bg_admin_choose_lecture(loading_msg, subject_id: int, page: int, cb_base: str) -> None:
+    try:
+        await _render_admin_lectures_into(loading_msg, subject_id, page, cb_base)
+    except Exception as e:
+        LOG.exception("فشل تحميل قائمة المحاضرات للأدمن", exc_info=e)
+        await safe_edit(loading_msg, "⚠️ حدث خطأ أثناء تحميل المحاضرات.")
+
+
+async def _bg_admin_links(loading_msg, page: int) -> None:
+    try:
+        await _render_admin_links_into(loading_msg, page)
+    except Exception as e:
+        LOG.exception("فشل تحميل الروابط", exc_info=e)
+        await safe_edit(loading_msg, "⚠️ حدث خطأ أثناء تحميل الروابط.")
+
+
+async def _bg_admin_admins(loading_msg) -> None:
+    try:
+        await _render_admin_admins_into(loading_msg)
+    except Exception as e:
+        LOG.exception("فشل تحميل الأدمنز", exc_info=e)
+        await safe_edit(loading_msg, "⚠️ حدث خطأ أثناء تحميل الأدمنز.")
+
+
+async def _bg_admin_stats(loading_msg) -> None:
+    try:
+        async with db_conn() as conn:
+            async with conn.execute("SELECT COUNT(*) AS c FROM users") as cur1:
+                users_c = int((await cur1.fetchone())["c"])
+            async with conn.execute("SELECT COUNT(*) AS c FROM subjects") as cur2:
+                sub_c = int((await cur2.fetchone())["c"])
+            async with conn.execute("SELECT COUNT(*) AS c FROM lectures") as cur3:
+                lec_c = int((await cur3.fetchone())["c"])
+            async with conn.execute("SELECT COUNT(*) AS c FROM uploads") as cur4:
+                up_c = int((await cur4.fetchone())["c"])
+        await safe_edit(
+            loading_msg,
+            "📊 الإحصائيات\n"
+            f"👥 عدد المستخدمين: {users_c}\n"
+            f"📚 عدد المواد: {sub_c}\n"
+            f"📄 عدد المحاضرات: {lec_c}\n"
+            f"📤 عدد الرفعات: {up_c}",
+            reply_markup=admin_panel_keyboard(),
+        )
+    except Exception as e:
+        LOG.exception("فشل تحميل الإحصائيات", exc_info=e)
+        await safe_edit(loading_msg, "⚠️ حدث خطأ أثناء تحميل الإحصائيات.")
 
 async def show_links(query, page: int) -> None:
     PAGE_SIZE = 12
@@ -1286,7 +1584,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
     # Log admin button click for debugging
     try:
-        log_admin_action(uid, f"ضغط_زر {data}")
+        log_admin_action(uid, f"ADMIN_CLICK: {data}")
     except Exception:
         pass
     if data in ("a:panel",):
@@ -1301,13 +1599,15 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "a:add_lecture":
         # Improved: choose subject, then upload documents (multi-upload session)
         context.user_data["admin_mode"] = "add_lecture_choose_subject"
-        await _admin_choose_subject_for_upload(query, page=0, cb_base="a:add_lecture")
+        loading = await query.message.reply_text("⏳ جاري تحميل المواد...")
+        schedule_task(context, _bg_admin_choose_subject(loading, 0, "a:add_lecture"), name="bg_admin_choose_subject_addlec")
         return
 
     if data.startswith("a:add_lecture:p="):
         page = _parse_page(data)
         context.user_data["admin_mode"] = "add_lecture_choose_subject"
-        await _admin_choose_subject_for_upload(query, page=page, cb_base="a:add_lecture")
+        loading = await query.message.reply_text("⏳ جاري تحميل المواد...")
+        schedule_task(context, _bg_admin_choose_subject(loading, page, "a:add_lecture"), name="bg_admin_choose_subject_addlec_p")
         return
 
     if data.startswith("a:add_lecture:subject="):
@@ -1339,13 +1639,15 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "a:import_batch":
         context.user_data["admin_mode"] = "import_batch_choose_subject"
-        await _admin_choose_subject_for_upload(query, page=0, cb_base="a:import_batch")
+        loading = await query.message.reply_text("⏳ جاري تحميل المواد...")
+        schedule_task(context, _bg_admin_choose_subject(loading, 0, "a:import_batch"), name="bg_admin_choose_subject_batch")
         return
 
     if data.startswith("a:import_batch:p="):
         page = _parse_page(data)
         context.user_data["admin_mode"] = "import_batch_choose_subject"
-        await _admin_choose_subject_for_upload(query, page=page, cb_base="a:import_batch")
+        loading = await query.message.reply_text("⏳ جاري تحميل المواد...")
+        schedule_task(context, _bg_admin_choose_subject(loading, page, "a:import_batch"), name="bg_admin_choose_subject_batch_p")
         return
 
     if data.startswith("a:import_batch:subject="):
@@ -1429,14 +1731,16 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sid = _parse_int_param(data, "subject")
         if sid is None:
             return
-        await _admin_choose_lecture(query, subject_id=sid, page=0, cb_base=f"a:delete_lecture_list:s={sid}")
+        loading = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
+        schedule_task(context, _bg_admin_choose_lecture(loading, sid, 0, f"a:delete_lecture_list:s={sid}"), name="bg_admin_choose_lecture_del")
         return
     if data.startswith("a:delete_lecture_list:s="):
         sid = _parse_int_param(data, "s")
         page = _parse_page(data)
         if sid is None:
             return
-        await _admin_choose_lecture(query, subject_id=sid, page=page, cb_base=f"a:delete_lecture_list:s={sid}")
+        loading = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
+        schedule_task(context, _bg_admin_choose_lecture(loading, sid, page, f"a:delete_lecture_list:s={sid}"), name="bg_admin_choose_lecture_del_p")
         return
     if data.startswith("a:delete_lecture_pick:s="):
         sid = _parse_int_param(data, "s")
@@ -1490,14 +1794,16 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sid = _parse_int_param(data, "subject")
         if sid is None:
             return
-        await _admin_choose_lecture(query, subject_id=sid, page=0, cb_base=f"a:edit_lecture_list:s={sid}")
+        loading = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
+        schedule_task(context, _bg_admin_choose_lecture(loading, sid, 0, f"a:edit_lecture_list:s={sid}"), name="bg_admin_choose_lecture_edit")
         return
     if data.startswith("a:edit_lecture_list:s="):
         sid = _parse_int_param(data, "s")
         page = _parse_page(data)
         if sid is None:
             return
-        await _admin_choose_lecture(query, subject_id=sid, page=page, cb_base=f"a:edit_lecture_list:s={sid}")
+        loading = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
+        schedule_task(context, _bg_admin_choose_lecture(loading, sid, page, f"a:edit_lecture_list:s={sid}"), name="bg_admin_choose_lecture_edit_p")
         return
     if data.startswith("a:edit_lecture_pick:s="):
         sid = _parse_int_param(data, "s")
@@ -1512,10 +1818,13 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # ---- Manage links ----
     if data == "a:manage_links":
-        await _admin_show_links_manage(query, page=0)
+        loading = await query.message.reply_text("⏳ جاري تحميل الروابط...")
+        schedule_task(context, _bg_admin_links(loading, 0), name="bg_admin_links")
         return
     if data.startswith("a:manage_links:p="):
-        await _admin_show_links_manage(query, page=_parse_page(data))
+        page = _parse_page(data)
+        loading = await query.message.reply_text("⏳ جاري تحميل الروابط...")
+        schedule_task(context, _bg_admin_links(loading, page), name="bg_admin_links_p")
         return
     if data == "a:links_reorder_init":
         await _ensure_links_positions()
@@ -1564,7 +1873,8 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # ---- Manage admins ----
     if data == "a:manage_admins":
-        await _admin_show_admins(query)
+        loading = await query.message.reply_text("⏳ جاري تحميل قائمة الأدمنز...")
+        schedule_task(context, _bg_admin_admins(loading), name="bg_admin_admins")
         return
     if data == "a:admins_add":
         context.user_data["admin_mode"] = "admins_add_user_id"
@@ -1594,23 +1904,8 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == "a:stats":
-        async with db_conn() as conn:
-            async with conn.execute("SELECT COUNT(*) AS c FROM users") as cur1:
-                users_c = int((await cur1.fetchone())["c"])
-            async with conn.execute("SELECT COUNT(*) AS c FROM subjects") as cur2:
-                sub_c = int((await cur2.fetchone())["c"])
-            async with conn.execute("SELECT COUNT(*) AS c FROM lectures") as cur3:
-                lec_c = int((await cur3.fetchone())["c"])
-            async with conn.execute("SELECT COUNT(*) AS c FROM uploads") as cur4:
-                up_c = int((await cur4.fetchone())["c"])
-        await query.message.reply_text(
-            "📊 الإحصائيات\n"
-            f"👥 عدد المستخدمين: {users_c}\n"
-            f"📚 عدد المواد: {sub_c}\n"
-            f"📄 عدد المحاضرات: {lec_c}\n"
-            f"📤 عدد الرفعات: {up_c}",
-            reply_markup=admin_panel_keyboard(),
-        )
+        loading = await query.message.reply_text("⏳ جاري تحميل الإحصائيات...")
+        schedule_task(context, _bg_admin_stats(loading), name="bg_admin_stats")
         return
 
     if data == "a:stop":
@@ -1658,8 +1953,8 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _admin_show_sort_lectures(query, subject_id=sid or 0, page=page)
         return
 
-    # required buttons exist; wiring/logic will be implemented in next steps
-    await query.message.reply_text("⚠️ أمر غير معروف أو غير مدعوم حاليًا.", reply_markup=markup([admin_nav_row()]))
+    # Fallback: unknown admin callback (never silent)
+    await query.message.reply_text("⚠️ هذا الزر غير متاح حاليًا", reply_markup=markup([admin_nav_row()]))
 
 
 async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1905,11 +2200,6 @@ async def _admin_choose_subject_for_upload(query, page: int, cb_base: str) -> No
     PAGE_SIZE = 12
     offset = page * PAGE_SIZE
     loading_msg = None
-    try:
-        if LIST_LOADING_EDIT:
-            loading_msg = await query.message.reply_text("⏳ جاري تحميل المواد...")
-    except Exception:
-        loading_msg = None
     async with db_conn() as conn:
         async with conn.execute(
             """
@@ -1922,13 +2212,7 @@ async def _admin_choose_subject_for_upload(query, page: int, cb_base: str) -> No
         ) as cur:
             rows = await cur.fetchall()
     if not rows:
-        if loading_msg:
-            try:
-                await safe_edit(loading_msg, "📌 لا توجد مواد بعد.")
-            except Exception:
-                await query.message.reply_text("📌 لا توجد مواد بعد.", reply_markup=admin_panel_keyboard())
-        else:
-            await query.message.reply_text("📌 لا توجد مواد بعد.", reply_markup=admin_panel_keyboard())
+        await query.message.reply_text("📌 لا توجد مواد بعد.", reply_markup=admin_panel_keyboard())
         return
     has_next = len(rows) > PAGE_SIZE
     rows = rows[:PAGE_SIZE]
@@ -1937,13 +2221,7 @@ async def _admin_choose_subject_for_upload(query, page: int, cb_base: str) -> No
     keyboard.extend(grid_2col(buttons))
     keyboard.append(pagination_row(base_cb=cb_base, page=page, has_prev=page > 0, has_next=has_next))
     keyboard.append(admin_nav_row())
-    if loading_msg:
-        try:
-            await safe_edit(loading_msg, "📚 اختر المادة:", reply_markup=markup(keyboard))
-        except Exception:
-            await query.message.reply_text("📚 اختر المادة:", reply_markup=markup(keyboard))
-    else:
-        await query.message.reply_text("📚 اختر المادة:", reply_markup=markup(keyboard))
+    await query.message.reply_text("📚 اختر المادة:", reply_markup=markup(keyboard))
 
 
 async def _admin_choose_subject_generic(query, page: int, cb_base: str) -> None:
@@ -1953,12 +2231,6 @@ async def _admin_choose_subject_generic(query, page: int, cb_base: str) -> None:
 async def _admin_choose_lecture(query, subject_id: int, page: int, cb_base: str) -> None:
     PAGE_SIZE = 12
     offset = page * PAGE_SIZE
-    loading_msg = None
-    try:
-        if LIST_LOADING_EDIT:
-            loading_msg = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
-    except Exception:
-        loading_msg = None
     async with db_conn() as conn:
         async with conn.execute(
             """
@@ -1972,13 +2244,7 @@ async def _admin_choose_lecture(query, subject_id: int, page: int, cb_base: str)
         ) as cur:
             rows = await cur.fetchall()
     if not rows:
-        if loading_msg:
-            try:
-                await safe_edit(loading_msg, "📌 لا توجد محاضرات.")
-            except Exception:
-                await query.message.reply_text("📌 لا توجد محاضرات.", reply_markup=admin_panel_keyboard())
-        else:
-            await query.message.reply_text("📌 لا توجد محاضرات.", reply_markup=admin_panel_keyboard())
+        await query.message.reply_text("📌 لا توجد محاضرات.", reply_markup=admin_panel_keyboard())
         return
     has_next = len(rows) > PAGE_SIZE
     rows = rows[:PAGE_SIZE]
@@ -1988,13 +2254,7 @@ async def _admin_choose_lecture(query, subject_id: int, page: int, cb_base: str)
     keyboard.extend(grid_2col(buttons))
     keyboard.append(pagination_row(base_cb=cb_base, page=page, has_prev=page > 0, has_next=has_next))
     keyboard.append(admin_nav_row())
-    if loading_msg:
-        try:
-            await safe_edit(loading_msg, "📄 اختر المحاضرة:", reply_markup=markup(keyboard))
-        except Exception:
-            await query.message.reply_text("📄 اختر المحاضرة:", reply_markup=markup(keyboard))
-    else:
-        await query.message.reply_text("📄 اختر المحاضرة:", reply_markup=markup(keyboard))
+    await query.message.reply_text("📄 اختر المحاضرة:", reply_markup=markup(keyboard))
 
 
 async def _admin_show_links_manage(query, page: int) -> None:
@@ -2244,7 +2504,24 @@ async def admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.callback_query:
-        await update.callback_query.answer()
+        await safe_answer(update.callback_query)
+
+
+async def unknown_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    await safe_answer(query)
+    uid = query.from_user.id
+    data = query.data or ""
+    try:
+        LOG.info("UNKNOWN_CLICK: %s %s", uid, data)
+    except Exception:
+        pass
+    try:
+        await query.message.reply_text("⚠️ هذا الزر غير متاح حاليًا")
+    except Exception:
+        pass
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2319,6 +2596,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(user_callbacks, pattern=r"^u:"))
     application.add_handler(CallbackQueryHandler(admin_callbacks, pattern=r"^a:"))
     application.add_handler(CallbackQueryHandler(user_callbacks, pattern=r"^nav:"))
+    application.add_handler(CallbackQueryHandler(unknown_callback))
 
     # messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))

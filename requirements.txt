@@ -1,2 +1,7 @@
+<<<<<<< HEAD
 python-telegram-bot==22.5
 aiosqlite==0.20.0
+=======
+python-telegram-bot[job-queue]==22.5
+aiosqlite
+>>>>>>> ab9a563ec212c4885845d51b84c9b09f2f399bdc

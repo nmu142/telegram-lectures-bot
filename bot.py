@@ -121,7 +121,7 @@ async def _add_column_if_missing(conn: aiosqlite.Connection, table: str, column:
 
 async def init_db() -> None:
     restore_db()
-  async with db_connect() as conn:
+    async with db_connect() as conn:
         await conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS subjects (

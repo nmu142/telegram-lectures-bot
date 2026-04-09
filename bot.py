@@ -1,7 +1,3 @@
-"""
-Production Telegram lecture management bot — full admin, search, favorites, pagination,
-broadcast (all media), bulk import, backups, maintenance mode.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -9,22 +5,16 @@ import logging
 import os
 import re
 import shutil
-import sqlite3
-import threading
 import time
-from datetime import datetime, timedelta
-from typing import Any, Callable, Optional
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Optional
 
-from telegram import (
-    BotCommand,
-    InputFile,
-    MenuButtonCommands,
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+import aiosqlite
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
+from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import (
-    AIORateLimiter,
     Application,
     CallbackQueryHandler,
     CommandHandler,
@@ -33,291 +23,49 @@ from telegram.ext import (
     filters,
 )
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+# =======================
+# CONFIG (keeps legacy defaults)
 
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("TOKEN", "").strip()
+if not TOKEN:
+    raise RuntimeError("TOKEN env var is required")
+
 MAIN_ADMIN_ID = int(os.getenv("MAIN_ADMIN_ID", "8377544927"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "El8awy116")
 
 DB_FILE = os.getenv("DB_FILE", "lectures.db")
 BACKUP_FILE = os.getenv("BACKUP_FILE", "backup.db")
-BACKUPS_DIR = os.getenv("BACKUPS_DIR", "backups")
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-IMPORT_BATCH_COMMIT_EVERY = int(os.getenv("IMPORT_BATCH_COMMIT_EVERY", "5"))
-BROADCAST_DELAY = float(os.getenv("BROADCAST_DELAY", "0.035"))
-AUTO_BACKUP_HOURS = int(os.getenv("AUTO_BACKUP_HOURS", "24"))
-LECTURES_PER_PAGE = 10
-LATEST_COUNT = 10
-CACHE_TTL_SEC = 45
-
-GITHUB_BACKUP_TOKEN = os.getenv("GITHUB_BACKUP_TOKEN", "")
-
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("lectures_bot")
-
-# -----------------------------------------------------------------------------
-# Maintenance
-# -----------------------------------------------------------------------------
 
 BOT_ENABLED = True
 
-MAINTENANCE_MESSAGE = (
-    "🚧 تم إيقاف البوت مؤقتًا لوجود تحديثات\n"
-    "وسيتم العودة في أسرع وقت ❤️"
+MAINTENANCE_MESSAGE = os.getenv(
+    "MAINTENANCE_MESSAGE",
+    "💡 عزيزي الطالب ❤️\n"
+    "البوت تحت التحديث حاليًا علشان نقدملك حاجة تليق بيك\n"
+    "ارجع قريبًا إن شاء الله ✨",
 )
 
-RATE_LIMIT_WINDOW = 10
-RATE_LIMIT_MAX_MESSAGES = 6
-RATE_LIMIT_BLOCK_SECONDS = 10
-RATE_LIMIT_MESSAGE = (
-    "🚫 برجاء الانتظار قليلًا قبل إرسال رسائل جديدة حتى لا يتعطل البوت."
+# Rate Limit (legacy constants kept)
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "10"))
+RATE_LIMIT_MAX_MESSAGES = int(os.getenv("RATE_LIMIT_MAX_MESSAGES", "5"))
+RATE_LIMIT_BLOCK_SECONDS = int(os.getenv("RATE_LIMIT_BLOCK_SECONDS", "10"))
+
+RATE_LIMIT_MESSAGE = os.getenv(
+    "RATE_LIMIT_MESSAGE",
+    "🚫 برجاء الانتظار 10 ثواني قبل إرسال رسائل جديدة حتى لا يتعطل البوت.",
 )
 
-user_messages: dict[int, list[float]] = {}
-blocked_users: dict[int, float] = {}
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Simple cache: (expires_at, value)
-_cache_subjects_non_empty: Optional[tuple[float, list[tuple[int, str, int]]]] = None
-# Lecture list pages: key (subject_id, page) -> (expires_at, (total, pages, page, rows))
-_cache_lecture_pages: dict[tuple[int, int], tuple[float, tuple[int, int, int, list]]] = {}
+# UX / performance tuning
+UPLOAD_SESSION_TIMEOUT_S = int(os.getenv("UPLOAD_SESSION_TIMEOUT_S", str(20 * 60)))
+UPLOAD_PROGRESS_EDIT_EVERY_S = float(os.getenv("UPLOAD_PROGRESS_EDIT_EVERY_S", "2.5"))
+LIST_LOADING_EDIT = True
 
+# =======================
+# LOG SYSTEM
 
-def cache_invalidate() -> None:
-    global _cache_subjects_non_empty, _cache_lecture_pages
-    _cache_subjects_non_empty = None
-    _cache_lecture_pages.clear()
-
-
-# -----------------------------------------------------------------------------
-# Title / file helpers
-# -----------------------------------------------------------------------------
-
-_HASH_SUFFIX = re.compile(r"_[a-fA-F0-9]{32}$")
-_HASH_SUFFIX_LONG = re.compile(r"_[a-fA-F0-9]{8,}$")
-# Trailing UUID (with or without underscores)
-_UUID_TAIL = re.compile(
-    r"[_-]?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
-)
-
-
-def extract_lecture_title_from_filename(filename: str) -> str:
-    """Title = basename without extension; strip hashes / UUID / long hex suffixes."""
-    base = os.path.splitext(os.path.basename(filename))[0]
-    base = _UUID_TAIL.sub("", base)
-    base = _HASH_SUFFIX.sub("", base)
-    base = _HASH_SUFFIX_LONG.sub("", base)
-    return base.strip()
-
-
-IMPORT_EXTENSIONS = frozenset(
-    {
-        ".pdf",
-        ".ppt",
-        ".pptx",
-        ".doc",
-        ".docx",
-        ".zip",
-        ".rar",
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".mp4",
-        ".mp3",
-    }
-)
-
-
-def file_allowed_for_import(name: str) -> bool:
-    low = name.lower()
-    return any(low.endswith(ext) for ext in IMPORT_EXTENSIONS)
-
-
-# -----------------------------------------------------------------------------
-# Backup
-# -----------------------------------------------------------------------------
-
-
-def ensure_backups_dir() -> None:
-    os.makedirs(BACKUPS_DIR, exist_ok=True)
-
-
-def save_db_mirror() -> None:
-    try:
-        if os.path.exists(DB_FILE):
-            shutil.copy2(DB_FILE, BACKUP_FILE)
-    except OSError as e:
-        logger.warning("save_db_mirror: %s", e)
-
-
-def restore_db_if_missing() -> None:
-    try:
-        if not os.path.exists(DB_FILE) and os.path.exists(BACKUP_FILE):
-            shutil.copy2(BACKUP_FILE, DB_FILE)
-            logger.info("Restored DB from backup.db")
-    except OSError as e:
-        logger.warning("restore_db_if_missing: %s", e)
-
-
-def admin_backup_timestamped() -> str:
-    ensure_backups_dir()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = os.path.join(BACKUPS_DIR, f"lectures_{ts}.db")
-    shutil.copy2(DB_FILE, dest)
-    shutil.copy2(DB_FILE, BACKUP_FILE)
-    return dest
-
-
-def commit_and_backup(conn: sqlite3.Connection) -> None:
-    conn.commit()
-    save_db_mirror()
-
-
-async def send_db_to_admins(bot) -> None:
-    if not os.path.exists(DB_FILE):
-        return
-    for aid in get_all_admins():
-        try:
-            with open(DB_FILE, "rb") as f:
-                await bot.send_document(
-                    chat_id=aid,
-                    document=InputFile(f, filename="lectures.db"),
-                    caption="📦 نسخة احتياطية تلقائية",
-                )
-        except Exception as e:
-            logger.warning("Telegram backup to %s: %s", aid, e)
-
-
-def optional_github_backup() -> None:
-    if not GITHUB_BACKUP_TOKEN:
-        return
-    logger.info("GitHub backup: token set — implement push to your repo/gist if needed.")
-
-
-# -----------------------------------------------------------------------------
-# Database
-# -----------------------------------------------------------------------------
-
-_db_lock = threading.Lock()
-_conn: Optional[sqlite3.Connection] = None
-
-
-def get_connection() -> sqlite3.Connection:
-    global _conn
-    with _db_lock:
-        if _conn is None:
-            _conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            _conn.row_factory = sqlite3.Row
-            _conn.execute("PRAGMA foreign_keys = ON")
-            _conn.execute("PRAGMA journal_mode = WAL")
-        return _conn
-
-
-class DbBatch:
-    def __init__(self, n: int = IMPORT_BATCH_COMMIT_EVERY) -> None:
-        self.n = max(1, n)
-        self._c = 0
-
-    def step(self, conn: sqlite3.Connection, force: bool = False) -> None:
-        self._c += 1
-        if force or self._c >= self.n:
-            commit_and_backup(conn)
-            self._c = 0
-
-
-def _migrate(conn: sqlite3.Connection) -> None:
-    c = conn.cursor()
-    c.execute("PRAGMA table_info(subjects)")
-    sub_cols = {row[1] for row in c.fetchall()}
-    c.execute("PRAGMA table_info(lectures)")
-    lec_cols = {row[1] for row in c.fetchall()}
-    if "sort_order" not in sub_cols:
-        c.execute("ALTER TABLE subjects ADD COLUMN sort_order INTEGER DEFAULT 0")
-        logger.info("Migration: subjects.sort_order")
-    if "download_count" not in lec_cols:
-        c.execute("ALTER TABLE lectures ADD COLUMN download_count INTEGER DEFAULT 0")
-        logger.info("Migration: lectures.download_count")
-    if "created_at" not in lec_cols:
-        c.execute("ALTER TABLE lectures ADD COLUMN created_at TEXT")
-        logger.info("Migration: lectures.created_at")
-    if "content_type" not in lec_cols:
-        c.execute(
-            "ALTER TABLE lectures ADD COLUMN content_type TEXT DEFAULT 'document'"
-        )
-        logger.info("Migration: lectures.content_type")
-
-
-def init_db() -> None:
-    restore_db_if_missing()
-    conn = get_connection()
-    c = conn.cursor()
-
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS subjects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            sort_order INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS lectures (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            subject_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            file_id TEXT NOT NULL,
-            content_type TEXT NOT NULL DEFAULT 'document',
-            download_count INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT,
-            FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS important_links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            url TEXT NOT NULL,
-            position INTEGER NOT NULL DEFAULT 999
-        )
-        """
-    )
-    c.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
-    c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS favorites (
-            user_id INTEGER NOT NULL,
-            lecture_id INTEGER NOT NULL,
-            PRIMARY KEY (user_id, lecture_id),
-            FOREIGN KEY(lecture_id) REFERENCES lectures(id) ON DELETE CASCADE
-        )
-        """
-    )
-
-    conn.commit()
-    _migrate(conn)
-    c = conn.cursor()
-    c.execute("UPDATE subjects SET sort_order = id WHERE sort_order IS NULL")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_lecture_title ON lectures(title)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_subject_name ON subjects(name)")
-    c.execute(
-        "CREATE INDEX IF NOT EXISTS idx_lectures_subject_id ON lectures(subject_id)"
-    )
-    conn.commit()
-    save_db_mirror()
-
-    if not os.path.exists("admin_log.txt"):
-        open("admin_log.txt", "a", encoding="utf-8").close()
+LOG = logging.getLogger("lectures_bot")
 
 
 def log_admin_action(user_id: int, action: str) -> None:
@@ -325,1652 +73,2114 @@ def log_admin_action(user_id: int, action: str) -> None:
     try:
         with open("admin_log.txt", "a", encoding="utf-8") as f:
             f.write(f"[{now}] Admin({user_id}) -> {action}\n")
-    except OSError:
+    except Exception:
         pass
 
 
-# --- Admins ---
+# =======================
+# BACKUP / RESTORE (best-effort, legacy-compatible)
 
 
-def get_extra_admins() -> list[int]:
-    c = get_connection().cursor()
-    c.execute("SELECT user_id FROM admins")
-    return [r[0] for r in c.fetchall()]
+def save_db() -> None:
+    try:
+        if os.path.exists(DB_FILE):
+            shutil.copy(DB_FILE, BACKUP_FILE)
+    except Exception:
+        pass
 
 
-def get_all_admins() -> list[int]:
-    return list({MAIN_ADMIN_ID, *get_extra_admins()})
+def restore_db() -> None:
+    try:
+        if not os.path.exists(DB_FILE) and os.path.exists(BACKUP_FILE):
+            shutil.copy(BACKUP_FILE, DB_FILE)
+    except Exception:
+        pass
 
 
-def is_main_admin(uid: int) -> bool:
-    return uid == MAIN_ADMIN_ID
+# =======================
+# DB (async, additive migrations only)
 
 
-def is_admin(uid: int) -> bool:
-    return uid in get_all_admins()
+async def db_connect() -> aiosqlite.Connection:
+    conn = await aiosqlite.connect(DB_FILE)
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA synchronous=NORMAL")
+    await conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = aiosqlite.Row
+    return conn
 
 
-def add_admin_user(user_id: int) -> bool:
-    if user_id == MAIN_ADMIN_ID:
+async def _add_column_if_missing(conn: aiosqlite.Connection, table: str, column: str, col_type: str) -> None:
+    async with conn.execute(f"PRAGMA table_info({table})") as cur:
+        rows = await cur.fetchall()
+    existing = {r[1] for r in rows}
+    if column in existing:
+        return
+    await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
+
+async def init_db() -> None:
+    restore_db()
+    async with await db_connect() as conn:
+        await conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS subjects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS lectures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_id INTEGER,
+                title TEXT,
+                file_id TEXT,
+                FOREIGN KEY(subject_id) REFERENCES subjects(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS important_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                url TEXT,
+                position INTEGER DEFAULT 999
+            );
+            """
+        )
+
+        # Additive columns
+        await _add_column_if_missing(conn, "subjects", "created_at", "INTEGER")
+        await _add_column_if_missing(conn, "subjects", "manual_order", "INTEGER")
+        await _add_column_if_missing(conn, "lectures", "created_at", "INTEGER")
+        await _add_column_if_missing(conn, "lectures", "manual_order", "INTEGER")
+        await _add_column_if_missing(conn, "users", "username", "TEXT")
+        await _add_column_if_missing(conn, "users", "first_name", "TEXT")
+        await _add_column_if_missing(conn, "users", "last_name", "TEXT")
+        await _add_column_if_missing(conn, "users", "updated_at", "INTEGER")
+
+        # Extensions
+        await conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id INTEGER NOT NULL,
+                lecture_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(user_id, lecture_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                status TEXT DEFAULT 'new'
+            );
+
+            CREATE TABLE IF NOT EXISTS uploads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                lecture_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            """
+        )
+
+        await conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_lectures_subject ON lectures(subject_id);
+            CREATE INDEX IF NOT EXISTS idx_lectures_title ON lectures(title);
+            CREATE INDEX IF NOT EXISTS idx_subjects_name ON subjects(name);
+            CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+            CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
+            CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
+            CREATE INDEX IF NOT EXISTS idx_links_position ON important_links(position, id);
+            """
+        )
+
+        # Optional: FTS for fast partial search (additive)
+        await conn.executescript(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS lectures_fts USING fts5(
+                title,
+                content='lectures',
+                content_rowid='id',
+                tokenize='unicode61 remove_diacritics 2'
+            );
+            """
+        )
+        # Triggers are safe to (re)create via IF NOT EXISTS pattern by checking sqlite_master
+        async with conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN "
+            "('lectures_ai','lectures_ad','lectures_au')"
+        ) as cur_tr:
+            existing_tr = {r[0] for r in await cur_tr.fetchall()}
+        if "lectures_ai" not in existing_tr:
+            await conn.execute(
+                """
+                CREATE TRIGGER lectures_ai AFTER INSERT ON lectures BEGIN
+                    INSERT INTO lectures_fts(rowid, title) VALUES (new.id, new.title);
+                END;
+                """
+            )
+        if "lectures_ad" not in existing_tr:
+            await conn.execute(
+                """
+                CREATE TRIGGER lectures_ad AFTER DELETE ON lectures BEGIN
+                    INSERT INTO lectures_fts(lectures_fts, rowid, title) VALUES('delete', old.id, old.title);
+                END;
+                """
+            )
+        if "lectures_au" not in existing_tr:
+            await conn.execute(
+                """
+                CREATE TRIGGER lectures_au AFTER UPDATE OF title ON lectures BEGIN
+                    INSERT INTO lectures_fts(lectures_fts, rowid, title) VALUES('delete', old.id, old.title);
+                    INSERT INTO lectures_fts(rowid, title) VALUES (new.id, new.title);
+                END;
+                """
+            )
+        # Backfill FTS if empty
+        async with conn.execute("SELECT COUNT(*) AS c FROM lectures_fts") as cur_fts:
+            fts_count = int((await cur_fts.fetchone())["c"])
+        if fts_count == 0:
+            await conn.execute("INSERT INTO lectures_fts(rowid, title) SELECT id, title FROM lectures")
+
+        now = int(time.time())
+        await conn.execute(
+            "UPDATE subjects SET created_at=COALESCE(created_at, ?) WHERE created_at IS NULL",
+            (now,),
+        )
+        await conn.execute(
+            "UPDATE lectures SET created_at=COALESCE(created_at, ?) WHERE created_at IS NULL",
+            (now,),
+        )
+        await conn.commit()
+
+    # legacy behavior
+    save_db()
+    if not os.path.exists("admin_log.txt"):
+        try:
+            with open("admin_log.txt", "a", encoding="utf-8"):
+                pass
+        except Exception:
+            pass
+
+
+# =======================
+# SECURITY: admin + rate limit
+
+
+class RateLimiter:
+    def __init__(self) -> None:
+        self.user_messages: dict[int, list[float]] = {}
+        self.blocked_until: dict[int, float] = {}
+
+    def check(self, user_id: int) -> bool:
+        now = time.time()
+        until = self.blocked_until.get(user_id)
+        if until and now < until:
+            return False
+        if until and now >= until:
+            self.blocked_until.pop(user_id, None)
+
+        msgs = self.user_messages.setdefault(user_id, [])
+        cutoff = now - RATE_LIMIT_WINDOW
+        while msgs and msgs[0] < cutoff:
+            msgs.pop(0)
+        msgs.append(now)
+        if len(msgs) > RATE_LIMIT_MAX_MESSAGES:
+            self.blocked_until[user_id] = now + RATE_LIMIT_BLOCK_SECONDS
+            self.user_messages[user_id] = []
+            return False
         return True
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO admins(user_id) VALUES (?)", (user_id,))
-    commit_and_backup(conn)
-    return c.rowcount > 0
 
 
-def remove_admin_user(user_id: int) -> bool:
-    if user_id == MAIN_ADMIN_ID:
+async def is_admin(uid: int) -> bool:
+    if uid == MAIN_ADMIN_ID:
+        return True
+    async with await db_connect() as conn:
+        async with conn.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)) as cur:
+            row = await cur.fetchone()
+            return row is not None
+
+
+# =======================
+# NAV / STATE
+
+
+def _nav_stack(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    st = context.user_data.setdefault("nav_stack", [])
+    if isinstance(st, list):
+        return st
+    context.user_data["nav_stack"] = []
+    return context.user_data["nav_stack"]
+
+
+def nav_push(context: ContextTypes.DEFAULT_TYPE, cb: str) -> None:
+    _nav_stack(context).append(cb)
+
+
+def nav_pop(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    st = _nav_stack(context)
+    if not st:
+        return None
+    return st.pop()
+
+
+def nav_clear(context: ContextTypes.DEFAULT_TYPE) -> None:
+    _nav_stack(context).clear()
+
+
+# Upload sessions (multi-upload) will be fully implemented in later todos.
+@dataclass
+class UploadSession:
+    mode: str  # add_lecture/import_folder/import_batch
+    subject_id: Optional[int] = None
+    created_at: int = 0
+    last_activity: int = 0
+    progress_chat_id: Optional[int] = None
+    progress_message_id: Optional[int] = None
+    last_progress_edit_ts: float = 0.0
+
+
+def get_upload_session(context: ContextTypes.DEFAULT_TYPE) -> Optional[UploadSession]:
+    s = context.user_data.get("upload_session")
+    if not isinstance(s, UploadSession):
+        return None
+    now = int(time.time())
+    last = s.last_activity or s.created_at or now
+    if UPLOAD_SESSION_TIMEOUT_S > 0 and (now - last) > UPLOAD_SESSION_TIMEOUT_S:
+        # expire silently; UX will prompt admin to restart flow
+        context.user_data.pop("upload_session", None)
+        context.user_data.pop("upload_counters", None)
+        return None
+    return s
+
+
+def set_upload_session(context: ContextTypes.DEFAULT_TYPE, session: Optional[UploadSession]) -> None:
+    if session is None:
+        context.user_data.pop("upload_session", None)
+        context.user_data.pop("upload_counters", None)
+    else:
+        now = int(time.time())
+        if not session.created_at:
+            session.created_at = now
+        session.last_activity = now
+        context.user_data["upload_session"] = session
+
+
+def cleanup_expired_upload_session(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Returns True if a session was expired/cleared."""
+    s = context.user_data.get("upload_session")
+    if not isinstance(s, UploadSession):
         return False
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
-    commit_and_backup(conn)
-    return c.rowcount > 0
+    now = int(time.time())
+    last = s.last_activity or s.created_at or now
+    if UPLOAD_SESSION_TIMEOUT_S > 0 and (now - last) > UPLOAD_SESSION_TIMEOUT_S:
+        context.user_data.pop("upload_session", None)
+        context.user_data.pop("upload_counters", None)
+        context.user_data.pop("admin_mode", None)
+        return True
+    return False
 
 
-# --- Users ---
+# =======================
+# MENUS / UI
 
 
-async def register_user(update: Update) -> None:
-    uid = update.effective_user.id
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (uid,))
-    commit_and_backup(conn)
+def btn(text: str, cb: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, callback_data=cb)
 
 
-def get_all_user_ids() -> list[int]:
-    c = get_connection().cursor()
-    c.execute("SELECT user_id FROM users")
-    return [r[0] for r in c.fetchall()]
+def url_btn(text: str, url: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, url=url)
 
 
-# --- Subjects / lectures ---
+def markup(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(rows)
 
 
-def get_subject_id_by_name(name: str) -> Optional[int]:
-    c = get_connection().cursor()
-    c.execute("SELECT id FROM subjects WHERE name = ?", (name,))
-    row = c.fetchone()
-    return int(row[0]) if row else None
-
-
-def insert_subject(name: str) -> int:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM subjects")
-    nxt = c.fetchone()[0]
-    c.execute("INSERT INTO subjects(name, sort_order) VALUES (?, ?)", (name, nxt))
-    commit_and_backup(conn)
-    cache_invalidate()
-    return int(c.lastrowid)
-
-
-def get_or_create_subject_id(name: str) -> int:
-    sid = get_subject_id_by_name(name)
-    if sid is not None:
-        return sid
-    return insert_subject(name)
-
-
-def lecture_exists(subject_id: int, title: str) -> bool:
-    c = get_connection().cursor()
-    c.execute(
-        "SELECT 1 FROM lectures WHERE subject_id = ? AND title = ? LIMIT 1",
-        (subject_id, title),
-    )
-    return c.fetchone() is not None
-
-
-def insert_lecture_full(
-    subject_id: int, title: str, file_id: str, content_type: str = "document"
-) -> int:
-    conn = get_connection()
-    c = conn.cursor()
-    now = datetime.utcnow().isoformat()
-    c.execute(
-        """
-        INSERT INTO lectures(subject_id, title, file_id, content_type, download_count, created_at)
-        VALUES (?, ?, ?, ?, 0, ?)
-        """,
-        (subject_id, title, file_id, content_type, now),
-    )
-    commit_and_backup(conn)
-    cache_invalidate()
-    return int(c.lastrowid)
-
-
-def insert_lecture_batched(
-    conn: sqlite3.Connection,
-    subject_id: int,
-    title: str,
-    file_id: str,
-    content_type: str,
-    batch: DbBatch,
-) -> int:
-    c = conn.cursor()
-    now = datetime.utcnow().isoformat()
-    c.execute(
-        """
-        INSERT INTO lectures(subject_id, title, file_id, content_type, download_count, created_at)
-        VALUES (?, ?, ?, ?, 0, ?)
-        """,
-        (subject_id, title, file_id, content_type, now),
-    )
-    last = int(c.lastrowid)
-    batch.step(conn)
-    cache_invalidate()
-    return last
-
-
-def increment_download(lecture_id: int) -> None:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE lectures SET download_count = download_count + 1 WHERE id = ?",
-        (lecture_id,),
-    )
-    commit_and_backup(conn)
-
-
-def get_subjects_non_empty_cached() -> list[tuple[int, str, int]]:
-    global _cache_subjects_non_empty
-    now = time.time()
-    if _cache_subjects_non_empty and _cache_subjects_non_empty[0] > now:
-        return _cache_subjects_non_empty[1]
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT s.id, s.name, COUNT(l.id) AS cnt
-        FROM subjects s
-        INNER JOIN lectures l ON l.subject_id = s.id
-        GROUP BY s.id
-        HAVING cnt > 0
-        ORDER BY s.sort_order ASC, s.name ASC
-        """
-    )
-    rows = [(int(r[0]), r[1], int(r[2])) for r in c.fetchall()]
-    _cache_subjects_non_empty = (now + CACHE_TTL_SEC, rows)
+def grid_2col(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButton]]:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(buttons), 2):
+        rows.append(buttons[i : i + 2])
     return rows
 
 
-def get_lectures_page(subject_id: int, page: int, per_page: int = LECTURES_PER_PAGE):
-    global _cache_lecture_pages
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        "SELECT COUNT(*) FROM lectures WHERE subject_id = ?",
-        (subject_id,),
-    )
-    total = int(c.fetchone()[0])
-    pages = max(1, (total + per_page - 1) // per_page)
-    page_clamped = max(0, min(page, pages - 1))
-    now = time.time()
-    key = (subject_id, page_clamped)
-    if key in _cache_lecture_pages:
-        exp, payload = _cache_lecture_pages[key]
-        if exp > now:
-            return payload
-
-    offset = page_clamped * per_page
-    c.execute(
-        """
-        SELECT id, title FROM lectures
-        WHERE subject_id = ?
-        ORDER BY id DESC
-        LIMIT ? OFFSET ?
-        """,
-        (subject_id, per_page, offset),
-    )
-    rows = c.fetchall()
-    payload = (total, pages, page_clamped, rows)
-    _cache_lecture_pages[key] = (now + CACHE_TTL_SEC, payload)
-    return payload
+def nav_row(*, show_back: bool = True, show_home: bool = True) -> list[InlineKeyboardButton]:
+    row: list[InlineKeyboardButton] = []
+    if show_back:
+        row.append(btn("🔙 رجوع", "nav:back"))
+    if show_home:
+        row.append(btn("🏠 الرئيسية", "u:home"))
+    return row
 
 
-def get_lecture_row(lid: int) -> Optional[sqlite3.Row]:
-    c = get_connection().cursor()
-    c.execute(
-        """
-        SELECT l.*, s.name AS subject_name FROM lectures l
-        JOIN subjects s ON s.id = l.subject_id
-        WHERE l.id = ?
-        """,
-        (lid,),
-    )
-    return c.fetchone()
+def admin_nav_row(*, show_back: bool = True, show_home: bool = True) -> list[InlineKeyboardButton]:
+    row: list[InlineKeyboardButton] = []
+    if show_back:
+        row.append(btn("🔙 رجوع", "a:panel"))
+    if show_home:
+        row.append(btn("🏠 الرئيسية", "u:home"))
+    return row
 
 
-def get_latest_lectures(n: int = LATEST_COUNT):
-    c = get_connection().cursor()
-    c.execute(
-        """
-        SELECT l.id, l.title, s.name FROM lectures l
-        JOIN subjects s ON s.id = l.subject_id
-        ORDER BY l.id DESC
-        LIMIT ?
-        """,
-        (n,),
-    )
-    return c.fetchall()
+def pagination_row(*, base_cb: str, page: int, has_prev: bool, has_next: bool) -> list[InlineKeyboardButton]:
+    row: list[InlineKeyboardButton] = []
+    if has_prev:
+        row.append(btn("⬅️ السابق", f"{base_cb}:p={page-1}"))
+    row.append(btn(f"📄 {page+1}", "noop"))
+    if has_next:
+        row.append(btn("➡️ التالي", f"{base_cb}:p={page+1}"))
+    return row
 
 
-def search_lectures(q: str) -> list[tuple[int, str, str]]:
-    """Case-insensitive partial match on lecture title and subject name (ASCII via LOWER)."""
-    text = (q or "").strip()
-    if not text:
-        return []
-    keyword = text.lower()
-    like = f"%{keyword}%"
-    c = get_connection().cursor()
-    c.execute(
-        """
-        SELECT lectures.id, lectures.title, subjects.name
-        FROM lectures
-        JOIN subjects ON subjects.id = lectures.subject_id
-        WHERE LOWER(lectures.title) LIKE ?
-           OR LOWER(subjects.name) LIKE ?
-        ORDER BY lectures.title
-        LIMIT 40
-        """,
-        (like, like),
-    )
-    return [(int(r[0]), r[1], r[2]) for r in c.fetchall()]
-
-
-def fav_add(uid: int, lid: int) -> bool:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR IGNORE INTO favorites(user_id, lecture_id) VALUES (?, ?)",
-        (uid, lid),
-    )
-    commit_and_backup(conn)
-    return c.rowcount > 0
-
-
-def fav_remove(uid: int, lid: int) -> None:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute(
-        "DELETE FROM favorites WHERE user_id = ? AND lecture_id = ?",
-        (uid, lid),
-    )
-    commit_and_backup(conn)
-
-
-def fav_is(uid: int, lid: int) -> bool:
-    c = get_connection().cursor()
-    c.execute(
-        "SELECT 1 FROM favorites WHERE user_id = ? AND lecture_id = ?",
-        (uid, lid),
-    )
-    return c.fetchone() is not None
-
-
-def fav_list(uid: int) -> list[tuple[int, str, str]]:
-    c = get_connection().cursor()
-    c.execute(
-        """
-        SELECT l.id, l.title, s.name FROM favorites f
-        JOIN lectures l ON l.id = f.lecture_id
-        JOIN subjects s ON s.id = l.subject_id
-        WHERE f.user_id = ?
-        ORDER BY l.title
-        LIMIT 50
-        """,
-        (uid,),
-    )
-    return [(int(r[0]), r[1], r[2]) for r in c.fetchall()]
-
-
-def stats_bundle() -> dict[str, Any]:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users")
-    nu = int(c.fetchone()[0])
-    c.execute("SELECT COUNT(*) FROM subjects")
-    ns = int(c.fetchone()[0])
-    c.execute("SELECT COUNT(*) FROM lectures")
-    nl = int(c.fetchone()[0])
-    c.execute("SELECT COUNT(*) FROM favorites")
-    nf = int(c.fetchone()[0])
-
-    c.execute(
-        """
-        SELECT s.name, COALESCE(SUM(l.download_count), 0) AS t
-        FROM subjects s
-        LEFT JOIN lectures l ON l.subject_id = s.id
-        GROUP BY s.id
-        HAVING COALESCE(SUM(l.download_count), 0) > 0
-        ORDER BY t DESC
-        LIMIT 1
-        """
-    )
-    top_sub = c.fetchone()
-
-    c.execute(
-        "SELECT title, download_count FROM lectures ORDER BY download_count DESC LIMIT 1"
-    )
-    top_lec = c.fetchone()
-
-    return {
-        "users": nu,
-        "subjects": ns,
-        "lectures": nl,
-        "favorites": nf,
-        "top_subject": (top_sub[0], int(top_sub[1])) if top_sub else ("—", 0),
-        "top_lecture": (top_lec[0], int(top_lec[1])) if top_lec else ("—", 0),
-    }
-
-
-# -----------------------------------------------------------------------------
-# Send lecture file by stored type
-# -----------------------------------------------------------------------------
-
-
-async def send_lecture_content(bot, chat_id: int, row: sqlite3.Row) -> None:
-    fid = row["file_id"]
-    ct = row["content_type"] or "document"
-    try:
-        if ct == "photo":
-            await bot.send_photo(chat_id=chat_id, photo=fid)
-        elif ct == "video":
-            await bot.send_video(chat_id=chat_id, video=fid)
-        elif ct == "animation":
-            await bot.send_animation(chat_id=chat_id, animation=fid)
-        elif ct == "audio":
-            await bot.send_audio(chat_id=chat_id, audio=fid)
-        elif ct == "voice":
-            await bot.send_voice(chat_id=chat_id, voice=fid)
-        elif ct == "video_note":
-            await bot.send_video_note(chat_id=chat_id, video_note=fid)
-        elif ct == "sticker":
-            await bot.send_sticker(chat_id=chat_id, sticker=fid)
-        else:
-            await bot.send_document(chat_id=chat_id, document=fid)
-    except Exception as e:
-        logger.warning("Fallback document send: %s", e)
-        await bot.send_document(chat_id=chat_id, document=fid)
-
-
-# -----------------------------------------------------------------------------
-# Bulk import (all file types as document path)
-# -----------------------------------------------------------------------------
-
-
-def iter_subject_folders(base_path: str) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    if not os.path.isdir(base_path):
-        return out
-    for name in sorted(os.listdir(base_path)):
-        p = os.path.join(base_path, name)
-        if os.path.isdir(p):
-            out.append((name, p))
-    return out
-
-
-def iter_import_files(folder: str) -> list[str]:
-    files: list[str] = []
-    for n in sorted(os.listdir(folder)):
-        p = os.path.join(folder, n)
-        if os.path.isfile(p) and file_allowed_for_import(n):
-            files.append(p)
-    return files
-
-
-def _default_import_base() -> str:
-    env = os.getenv("LECTURES_IMPORT_PATH")
-    if env:
-        return os.path.abspath(env)
-    lectures = os.path.join(SCRIPT_DIR, "lectures")
-    if os.path.isdir(lectures):
-        return lectures
-    return SCRIPT_DIR
-
-
-async def import_lectures_from_folders(
-    base_path: str,
-    bot,
-    chat_id: int,
-    progress_callback: Optional[Callable[[str], Any]] = None,
-) -> tuple[int, int, int]:
-    created = skipped = errors = 0
-    conn = get_connection()
-    batch = DbBatch()
-
-    async def report(msg: str) -> None:
-        logger.info(msg)
-        if progress_callback:
-            try:
-                r = progress_callback(msg)
-                if asyncio.iscoroutine(r):
-                    await r
-            except Exception as e:
-                logger.debug("progress: %s", e)
-
-    folders = iter_subject_folders(base_path)
-    if not folders:
-        await report(f"⚠️ لا توجد مجلدات مواد داخل:\n{base_path}")
-        return 0, 0, 0
-
-    total_files = sum(len(iter_import_files(fp)) for _, fp in folders)
-    await report(f"📥 استيراد من:\n{base_path}\n📂 مجلدات: {len(folders)} — ملفات: {total_files}")
-
-    for subject_name, folder_path in folders:
-        subject_id = get_or_create_subject_id(subject_name)
-        for fpath in iter_import_files(folder_path):
-            title = extract_lecture_title_from_filename(fpath)
-            if not title:
-                errors += 1
-                continue
-            if lecture_exists(subject_id, title):
-                skipped += 1
-                await report(f"⏭ تخطي: {subject_name} / {title}")
-                continue
-            try:
-                with open(fpath, "rb") as f:
-                    msg = await bot.send_document(
-                        chat_id=chat_id,
-                        document=InputFile(f, filename=os.path.basename(fpath)),
-                        disable_notification=True,
-                    )
-                doc = msg.document
-                if not doc:
-                    errors += 1
-                    continue
-                insert_lecture_batched(
-                    conn, subject_id, title, doc.file_id, "document", batch
-                )
-                created += 1
-                await report(f"✅ {created+skipped+errors}/{total_files} — {title}")
-            except Exception as e:
-                errors += 1
-                logger.exception("import fail %s", fpath)
-                await report(f"❌ {title}: {e!s}")
-
-    batch.step(conn, force=True)
-    save_db_mirror()
-    await report(f"🏁 انتهى.\n✅ جديد: {created}\n⏭ تخطي: {skipped}\n❌ أخطاء: {errors}")
-    return created, skipped, errors
-
-
-# -----------------------------------------------------------------------------
-# UI — 2 columns where possible
-# -----------------------------------------------------------------------------
-
-
-def kb_main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def main_menu() -> InlineKeyboardMarkup:
+    return markup(
         [
-            [
-                InlineKeyboardButton("📚 الدخول للمواد", callback_data="u_subjects"),
-                InlineKeyboardButton("🆕 أحدث المحاضرات", callback_data="u_latest"),
-            ],
-            [
-                InlineKeyboardButton("🔍 البحث عن محاضرة", callback_data="u_search"),
-                InlineKeyboardButton("⭐ المفضلة", callback_data="u_fav"),
-            ],
-            [
-                InlineKeyboardButton("📥 تحميل كل محاضرات المادة", callback_data="u_dl_pick_sub"),
-                InlineKeyboardButton("🔗 لينكات مهمة", callback_data="u_links"),
-            ],
-            [
-                InlineKeyboardButton("📊 إحصائيات البوت", callback_data="u_pubstats"),
-                InlineKeyboardButton("🛠 الإبلاغ عن مشكلة", callback_data="u_report"),
-            ],
-            [
-                InlineKeyboardButton(
-                    "👤 التواصل مع الأدمن",
-                    url=f"https://t.me/{ADMIN_USERNAME}",
-                )
-            ],
-        ]
-    )
-
-
-def kb_back_home() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🏠 الرئيسية", callback_data="u_home")]]
-    )
-
-
-def kb_lecture_nav(subject_id: int, page: int, pages: int) -> list[list[InlineKeyboardButton]]:
-    row = []
-    if page > 0:
-        row.append(
-            InlineKeyboardButton("⬅️ السابق", callback_data=f"u_lecp_{subject_id}_{page-1}")
-        )
-    if page < pages - 1:
-        row.append(
-            InlineKeyboardButton("➡️ التالي", callback_data=f"u_lecp_{subject_id}_{page+1}")
-        )
-    nav = [row] if row else []
-    nav.append(
-        [
-            InlineKeyboardButton("🔙 رجوع للمواد", callback_data="u_subjects"),
-            InlineKeyboardButton("🏠 الرئيسية", callback_data="u_home"),
-        ]
-    )
-    return nav
-
-
-def kb_after_lecture(lid: int, uid: int) -> InlineKeyboardMarkup:
-    on = fav_is(uid, lid)
-    fav_label = "⭐ إزالة من المفضلة" if on else "⭐ إضافة للمفضلة"
-    fav_cb = f"u_favtog_{lid}"
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(fav_label, callback_data=fav_cb)],
-            [
-                InlineKeyboardButton("📂 المفضلة", callback_data="u_fav"),
-                InlineKeyboardButton("🏠 الرئيسية", callback_data="u_home"),
-            ],
+            [btn("📚 المواد", "u:subjects:p=0")],
+            [btn("🔗 لينكات مهمة", "u:links:p=0")],
+            [btn("📝 طلب محاضرة / إبلاغ عن نقص", "u:request")],
+            [btn("🔎 البحث عن محاضرة", "u:search")],
+            [btn("🆕 أحدث المحاضرات", "u:latest")],
+            [btn("⭐ المفضلة", "u:favorites:p=0")],
+            [url_btn("👤 التواصل مع الأدمن", f"https://t.me/{ADMIN_USERNAME}")],
         ]
     )
 
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("➕ إضافة مادة", callback_data="adm_add_subject"),
-                InlineKeyboardButton("➕ إضافة محاضرة", callback_data="adm_add_lecture"),
-            ],
-            [
-                InlineKeyboardButton("📂 استيراد مجلد كامل", callback_data="adm_import_folder"),
-                InlineKeyboardButton("📥 استيراد دفعة واحدة", callback_data="adm_import"),
-            ],
-            [
-                InlineKeyboardButton("🗑 حذف مادة", callback_data="adm_del_subject"),
-                InlineKeyboardButton("🗑 حذف محاضرة", callback_data="adm_del_lecture"),
-            ],
-            [
-                InlineKeyboardButton("✏️ تعديل اسم مادة", callback_data="adm_edit_subject"),
-                InlineKeyboardButton("✏️ تعديل عنوان محاضرة", callback_data="adm_edit_lecture"),
-            ],
-            [InlineKeyboardButton("⬆️ ترتيب المواد", callback_data="adm_sort_subjects")],
-            [InlineKeyboardButton("🔗 إدارة اللينكات", callback_data="adm_links")],
-            [
-                InlineKeyboardButton("📢 رسالة جماعية", callback_data="adm_broadcast"),
-                InlineKeyboardButton("📊 إحصائيات", callback_data="adm_stats"),
-            ],
-            [
-                InlineKeyboardButton("📦 Backup Database", callback_data="adm_backup"),
-                InlineKeyboardButton("🧹 تنظيف الداتا", callback_data="adm_cleanup"),
-            ],
-            [
-                InlineKeyboardButton("⏸ إيقاف البوت", callback_data="adm_stop"),
-                InlineKeyboardButton("▶️ تشغيل البوت", callback_data="adm_start"),
-            ],
-            [InlineKeyboardButton("👑 إدارة المشرفين", callback_data="adm_admins")],
-            [InlineKeyboardButton("🏠 رجوع للأدمن", callback_data="adm_home")],
-        ]
-    )
+    buttons = [
+        btn("➕📚 Add subject", "a:add_subject"),
+        btn("➕📄 Add lecture", "a:add_lecture"),
+        btn("📥📁 Import folder", "a:import_folder"),
+        btn("📥🗂 Import batch", "a:import_batch"),
+        btn("🗑️📚 Delete subject", "a:delete_subject"),
+        btn("🗑️📄 Delete lecture", "a:delete_lecture"),
+        btn("✏️📚 Edit subject", "a:edit_subject"),
+        btn("✏️📄 Edit lecture", "a:edit_lecture"),
+        btn("↕️📚 Sort subjects", "a:sort_subjects"),
+        btn("🔗 Manage links", "a:manage_links"),
+        btn("📢 Broadcast", "a:broadcast"),
+        btn("📊 Statistics", "a:stats"),
+        btn("💾 Backup DB", "a:backup"),
+        btn("🧹 Clean data", "a:clean"),
+        btn("⛔ Stop bot", "a:stop"),
+        btn("✅ Start bot", "a:start"),
+        btn("👮 Manage admins", "a:manage_admins"),
+        btn("⬅️ Back to admin", "a:panel"),
+    ]
+    rows = grid_2col(buttons)
+    rows.append(nav_row(show_back=False, show_home=True))
+    return markup(rows)
 
 
-# -----------------------------------------------------------------------------
-# Rate limit
-# -----------------------------------------------------------------------------
+# =======================
+# HELPERS
 
 
-def check_rate_limit(user_id: int) -> bool:
-    now = time.time()
-    if user_id in blocked_users:
-        if now < blocked_users[user_id]:
-            return False
-        del blocked_users[user_id]
-    user_messages.setdefault(user_id, [])
-    user_messages[user_id] = [t for t in user_messages[user_id] if now - t < RATE_LIMIT_WINDOW]
-    user_messages[user_id].append(now)
-    if len(user_messages[user_id]) > RATE_LIMIT_MAX_MESSAGES:
-        blocked_users[user_id] = now + RATE_LIMIT_BLOCK_SECONDS
-        return False
-    return True
+def _parse_int_param(data: str, key: str) -> Optional[int]:
+    token = f"{key}="
+    if token not in data:
+        return None
+    try:
+        after = data.split(token, 1)[1]
+        num = after.split(":", 1)[0]
+        return int(num)
+    except Exception:
+        return None
 
 
-# -----------------------------------------------------------------------------
-# Commands & entry
-# -----------------------------------------------------------------------------
+def _parse_page(data: str) -> int:
+    p = _parse_int_param(data, "p")
+    return p if p is not None and p >= 0 else 0
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    if not check_rate_limit(uid):
+async def register_user(update: Update) -> None:
+    if not update.effective_user:
+        return
+    u = update.effective_user
+    now = int(time.time())
+    async with await db_connect() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users(user_id, username, first_name, last_name, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                updated_at=excluded.updated_at
+            """,
+            (u.id, u.username, u.first_name, u.last_name, now),
+        )
+        await conn.commit()
+    save_db()
+
+
+# =======================
+# USER HANDLERS
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    limiter: RateLimiter = context.application.bot_data["limiter"]
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid and not limiter.check(uid):
         await update.message.reply_text(RATE_LIMIT_MESSAGE)
         return
+
+    if not BOT_ENABLED and uid and not await is_admin(uid):
+        await update.message.reply_text(MAINTENANCE_MESSAGE)
+        return
+
     await register_user(update)
-    if not BOT_ENABLED and not is_admin(uid):
-        await update.message.reply_text(MAINTENANCE_MESSAGE)
-        return
     await update.message.reply_text(
-        "✨ أهلاً بك\nاختر من القائمة:",
-        reply_markup=kb_main_menu(),
+        "✨ أهلاً بيك عزيزي الطالب\nأتمنالك تجربة ممتعة وموفقة بإذن الله ❤️📚",
+        reply_markup=main_menu(),
     )
 
 
-async def cmd_subjects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _gate(update):
-        return
-    await register_user(update)
-    await send_subjects_screen(update.message)
-
-
-async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _gate(update):
-        return
-    context.user_data["search_mode"] = True
-    await update.message.reply_text(
-        "🔍 اكتب كلمة البحث (في عنوان المحاضرة أو اسم المادة):",
-        reply_markup=kb_back_home(),
-    )
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    if not BOT_ENABLED and not is_admin(uid):
-        await update.message.reply_text(MAINTENANCE_MESSAGE)
-        return
-    await update.message.reply_text(
-        "📖 **مساعدة**\n\n"
-        "/start — القائمة الرئيسية\n"
-        "/subjects — عرض المواد\n"
-        "/search — بحث عن محاضرة\n"
-        "/help — هذه الرسالة\n"
-        "/admin — لوحة المشرفين (للمصرّح لهم فقط)\n",
-        parse_mode="Markdown",
-        reply_markup=kb_back_home(),
-    )
-
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ غير مصرّح.")
-        return
-    await update.message.reply_text(
-        "🛠 لوحة التحكم",
-        reply_markup=admin_panel_keyboard(),
-    )
-
-
-async def _gate(update: Update) -> bool:
-    uid = update.effective_user.id
-    if not BOT_ENABLED and not is_admin(uid):
-        await update.message.reply_text(MAINTENANCE_MESSAGE)
-        return False
-    return True
-
-
-async def send_subjects_screen(message) -> None:
-    rows = get_subjects_non_empty_cached()
-    if not rows:
-        await message.reply_text("📌 لا توجد مواد تحتوي محاضرات بعد.", reply_markup=kb_back_home())
-        return
-    kb = []
-    pair: list[InlineKeyboardButton] = []
-    for sid, name, cnt in rows:
-        pair.append(
-            InlineKeyboardButton(f"{name} ({cnt})", callback_data=f"u_sub_{sid}_0")
-        )
-        if len(pair) == 2:
-            kb.append(pair)
-            pair = []
-    if pair:
-        kb.append(pair)
-    kb.append(
-        [InlineKeyboardButton("🏠 الرئيسية", callback_data="u_home")]
-    )
-    await message.reply_text("📚 المواد — اختر مادة:", reply_markup=InlineKeyboardMarkup(kb))
-
-
-async def send_lecture_page(query, subject_id: int, page: int) -> None:
-    total, pages, page, items = get_lectures_page(subject_id, page)
-    if total == 0:
-        await query.message.reply_text("📌 لا توجد محاضرات.", reply_markup=kb_back_home())
-        return
-    c = get_connection().cursor()
-    c.execute("SELECT name FROM subjects WHERE id = ?", (subject_id,))
-    sname = c.fetchone()[0]
-    lines = [f"📘 **{sname}**\n📄 المحاضرات — صفحة {page + 1}/{pages}\n"]
-    kb = []
-    for lid, title in items:
-        kb.append([InlineKeyboardButton(title[:64], callback_data=f"u_get_{lid}")])
-    kb.extend(kb_lecture_nav(subject_id, page, pages))
-    await query.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-
-
-# -----------------------------------------------------------------------------
-# User callbacks (prefix u_)
-# -----------------------------------------------------------------------------
-
-
-async def user_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if not query or not query.from_user:
+        return
     await query.answer()
+
+    limiter: RateLimiter = context.application.bot_data["limiter"]
     uid = query.from_user.id
-    if not BOT_ENABLED and not is_admin(uid):
+    if not limiter.check(uid):
+        await query.message.reply_text(RATE_LIMIT_MESSAGE)
+        return
+
+    if not BOT_ENABLED and not await is_admin(uid):
         await query.message.reply_text(MAINTENANCE_MESSAGE)
         return
 
-    d = query.data or ""
+    data = query.data or ""
 
-    if d == "u_home":
-        await query.message.reply_text("🏠 القائمة الرئيسية", reply_markup=kb_main_menu())
+    if data == "u:home":
+        nav_clear(context)
+        await query.message.reply_text("🏠 القائمة الرئيسية", reply_markup=main_menu())
         return
 
-    if d == "u_subjects":
-        await send_subjects_screen(query.message)
-        return
-
-    if d == "u_latest":
-        rows = get_latest_lectures(LATEST_COUNT)
-        if not rows:
-            await query.message.reply_text("📌 لا توجد محاضرات بعد.", reply_markup=kb_back_home())
+    if data == "nav:back":
+        prev = nav_pop(context)
+        if not prev:
+            await query.message.reply_text("🏠 القائمة الرئيسية", reply_markup=main_menu())
             return
-        kb = []
-        for lid, title, sname in rows:
-            kb.append(
-                [
-                    InlineKeyboardButton(
-                        f"{title[:40]} — {sname[:20]}",
-                        callback_data=f"u_get_{lid}",
-                    )
-                ]
+        query.data = prev
+        await user_callbacks(update, context)
+        return
+
+    if data.startswith("u:subjects"):
+        nav_push(context, "u:home")
+        await show_subjects(query, page=_parse_page(data))
+        return
+
+    if data.startswith("u:lectures"):
+        sid = _parse_int_param(data, "s")
+        if sid is None:
+            return
+        nav_push(context, "u:subjects:p=0")
+        await show_lectures(query, sid, page=_parse_page(data))
+        return
+
+    if data.startswith("u:lec:"):
+        lid = _parse_int_param(data, "id")
+        if lid is None:
+            return
+        async with await db_connect() as conn:
+            async with conn.execute("SELECT file_id, title FROM lectures WHERE id=?", (lid,)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                await query.message.reply_text("⚠️ المحاضرة غير موجودة.", reply_markup=markup([nav_row()]))
+                return
+            async with conn.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND lecture_id=?",
+                (uid, lid),
+            ) as cur2:
+                fav = await cur2.fetchone()
+        fav_text = "⭐ إزالة من المفضلة" if fav else "⭐ حفظ في المفضلة"
+        await query.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
+        await query.message.reply_document(
+            row["file_id"],
+            caption=f"📄 {row['title']}",
+            reply_markup=markup([[btn(fav_text, f"u:fav_toggle:id={lid}")], nav_row()]),
+        )
+        return
+
+    if data.startswith("u:fav_toggle:"):
+        lid = _parse_int_param(data, "id")
+        if lid is None:
+            return
+        now = int(time.time())
+        async with await db_connect() as conn:
+            async with conn.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND lecture_id=?",
+                (uid, lid),
+            ) as cur:
+                exists = await cur.fetchone()
+            if exists:
+                await conn.execute("DELETE FROM favorites WHERE user_id=? AND lecture_id=?", (uid, lid))
+                await conn.commit()
+                save_db()
+                await query.message.reply_text("✅ تم الإزالة من المفضلة.", reply_markup=markup([nav_row()]))
+            else:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO favorites(user_id, lecture_id, created_at) VALUES(?,?,?)",
+                    (uid, lid, now),
+                )
+                await conn.commit()
+                save_db()
+                await query.message.reply_text("✅ تم الحفظ في المفضلة.", reply_markup=markup([nav_row()]))
+        return
+
+    if data.startswith("u:links"):
+        nav_push(context, "u:home")
+        await show_links(query, page=_parse_page(data))
+        return
+
+    if data == "u:request":
+        nav_push(context, "u:home")
+        context.user_data["waiting_request_text"] = True
+        await query.message.reply_text("📝 اكتب طلبك وسيتم إرساله للأدمن.", reply_markup=markup([nav_row()]))
+        return
+
+    if data == "u:latest":
+        nav_push(context, "u:home")
+        await show_latest(query)
+        return
+
+    if data.startswith("u:favorites"):
+        nav_push(context, "u:home")
+        await show_favorites(query, user_id=uid, page=_parse_page(data))
+        return
+
+    if data == "u:search":
+        nav_push(context, "u:home")
+        context.user_data["waiting_search_query"] = True
+        await query.message.reply_text("🔎 اكتب جزء من اسم المحاضرة للبحث.", reply_markup=markup([nav_row()]))
+        return
+
+    if data.startswith("u:search_results"):
+        q = context.user_data.get("last_search_query") or ""
+        page = _parse_page(data)
+        await show_search_results(query, query_text=str(q), page=page)
+        return
+
+
+async def user_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    limiter: RateLimiter = context.application.bot_data["limiter"]
+    uid = update.effective_user.id
+    if not limiter.check(uid):
+        await update.message.reply_text(RATE_LIMIT_MESSAGE)
+        return
+
+    if not BOT_ENABLED and not await is_admin(uid):
+        await update.message.reply_text(MAINTENANCE_MESSAGE)
+        return
+
+    if context.user_data.get("waiting_request_text"):
+        text = (update.message.text or "").strip()
+        if not text:
+            return
+        context.user_data.pop("waiting_request_text", None)
+        now = int(time.time())
+        async with await db_connect() as conn:
+            await conn.execute(
+                "INSERT INTO requests(user_id, text, created_at, status) VALUES(?,?,?,?)",
+                (uid, text, now, "new"),
             )
-        kb.append([InlineKeyboardButton("🏠 الرئيسية", callback_data="u_home")])
-        await query.message.reply_text(
-            f"🆕 أحدث {LATEST_COUNT} محاضرات:",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-        return
-
-    if d == "u_search":
-        context.user_data["search_mode"] = True
-        await query.message.reply_text(
-            "🔍 اكتب كلمة البحث في المحادثة:",
-            reply_markup=kb_back_home(),
-        )
-        return
-
-    if d == "u_fav":
-        fl = fav_list(uid)
-        if not fl:
-            await query.message.reply_text(
-                "📂 المفضلة فارغة.",
-                reply_markup=kb_back_home(),
-            )
-            return
-        kb = []
-        for lid, title, sname in fl:
-            kb.append(
-                [
-                    InlineKeyboardButton(
-                        f"{title[:45]} ({sname[:15]})",
-                        callback_data=f"u_get_{lid}",
-                    )
-                ]
-            )
-        kb.append([InlineKeyboardButton("🏠 الرئيسية", callback_data="u_home")])
-        await query.message.reply_text("⭐ مفضلاتك:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if d == "u_dl_pick_sub":
-        rows = get_subjects_non_empty_cached()
-        if not rows:
-            await query.message.reply_text("📌 لا توجد مواد.", reply_markup=kb_back_home())
-            return
-        kb = []
-        for sid, name, _ in rows:
-            kb.append(
-                [
-                    InlineKeyboardButton(
-                        name[:50], callback_data=f"u_dlall_{sid}"
-                    )
-                ]
-            )
-        kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="u_home")])
-        await query.message.reply_text(
-            "📥 اختر المادة لتحميل كل محاضراتها (قد يستغرق وقتًا):",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-        return
-
-    if d.startswith("u_dlall_"):
-        sid = int(d.replace("u_dlall_", ""))
-        c = get_connection().cursor()
-        c.execute(
-            "SELECT id FROM lectures WHERE subject_id = ? ORDER BY id",
-            (sid,),
-        )
-        lids = [r[0] for r in c.fetchall()]
-        await query.message.reply_text(f"⏳ جاري الإرسال — {len(lids)} ملف...")
-        for lid in lids:
-            row = get_lecture_row(lid)
-            if row:
-                try:
-                    await send_lecture_content(context.bot, uid, row)
-                    increment_download(lid)
-                except Exception as e:
-                    logger.warning("dlall %s: %s", lid, e)
-            await asyncio.sleep(0.12)
-        await query.message.reply_text("✅ اكتمل التحميل.", reply_markup=kb_back_home())
-        return
-
-    if d == "u_links":
-        c = get_connection().cursor()
-        c.execute(
-            "SELECT title, url FROM important_links ORDER BY position, id"
-        )
-        rows = c.fetchall()
-        if not rows:
-            await query.message.reply_text("📌 لا توجد لينكات.", reply_markup=kb_back_home())
-            return
-        lines = ["🔗 **لينكات مهمة**\n"]
-        for t, u in rows:
-            lines.append(f"• [{t}]({u})")
-        await query.message.reply_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-            reply_markup=kb_back_home(),
-        )
-        return
-
-    if d == "u_pubstats":
-        st = stats_bundle()
-        await query.message.reply_text(
-            "📊 **إحصائيات البوت**\n"
-            f"👥 المستخدمون: {st['users']}\n"
-            f"📚 المواد: {st['subjects']}\n"
-            f"📄 المحاضرات: {st['lectures']}\n"
-            f"⭐ المفضلة: {st['favorites']}\n",
-            parse_mode="Markdown",
-            reply_markup=kb_back_home(),
-        )
-        return
-
-    if d == "u_report":
-        await query.message.reply_text(
-            "🛠 للإبلاغ عن مشكلة تواصل مع الأدمن من زر التواصل.",
-            reply_markup=kb_back_home(),
-        )
-        return
-
-    if d.startswith("u_sub_"):
-        # u_sub_{sid}_{page}
-        parts = d.split("_")
-        if len(parts) >= 4 and parts[1] == "sub":
-            sid = int(parts[2])
-            page = int(parts[3])
-            await send_lecture_page(query, sid, page)
-        return
-
-    if d.startswith("u_lecp_"):
-        rest = d[len("u_lecp_") :]
-        sid_s, _, pg_s = rest.rpartition("_")
-        if sid_s and pg_s.isdigit():
-            await send_lecture_page(query, int(sid_s), int(pg_s))
-        return
-
-    if d.startswith("u_get_"):
-        lid = int(d.replace("u_get_", ""))
-        row = get_lecture_row(lid)
-        if not row:
-            await query.message.reply_text("❌ غير موجود.")
-            return
+            await conn.commit()
+        save_db()
         try:
-            await send_lecture_content(context.bot, uid, row)
-            increment_download(lid)
-        except Exception as e:
-            logger.exception("send lecture")
-            await query.message.reply_text(f"❌ تعذر الإرسال: {e}")
+            await context.bot.send_message(chat_id=MAIN_ADMIN_ID, text=f"📝 طلب جديد من المستخدم {uid}:\n\n{text}")
+        except Exception:
+            pass
+        await update.message.reply_text("✅ تم إرسال طلبك للأدمن.", reply_markup=main_menu())
+        return
+
+    if context.user_data.get("waiting_search_query"):
+        q = (update.message.text or "").strip()
+        if not q:
             return
-        await query.message.reply_text(
-            f"📄 {row['title']}\n📚 {row['subject_name']}",
-            reply_markup=kb_after_lecture(lid, uid),
-        )
+        context.user_data["waiting_search_query"] = False
+        context.user_data["last_search_query"] = q
+        await show_search_results(update.message, query_text=q, page=0, is_message=True)
         return
 
-    if d.startswith("u_favtog_"):
-        lid = int(d.replace("u_favtog_", ""))
-        if fav_is(uid, lid):
-            fav_remove(uid, lid)
-            await query.answer("أُزيلت من المفضلة", show_alert=False)
+
+async def show_subjects(query, page: int) -> None:
+    PAGE_SIZE = 12
+    offset = page * PAGE_SIZE
+    loading_msg = None
+    try:
+        if LIST_LOADING_EDIT:
+            loading_msg = await query.message.reply_text("⏳ جاري تحميل المواد...")
+    except Exception:
+        loading_msg = None
+    async with await db_connect() as conn:
+        async with conn.execute(
+            """
+            SELECT id, name
+            FROM subjects
+            ORDER BY COALESCE(manual_order, 999999999), created_at, id
+            LIMIT ? OFFSET ?
+            """,
+            (PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        if loading_msg:
+            try:
+                await loading_msg.edit_text("📌 لا توجد مواد بعد.")
+            except Exception:
+                await query.message.reply_text("📌 لا توجد مواد بعد.", reply_markup=markup([nav_row()]))
         else:
-            fav_add(uid, lid)
-            await query.answer("أُضيفت للمفضلة", show_alert=False)
-        await query.message.reply_text(
-            "تم التحديث.",
-            reply_markup=kb_after_lecture(lid, uid),
-        )
+            await query.message.reply_text("📌 لا توجد مواد بعد.", reply_markup=markup([nav_row()]))
         return
 
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    buttons = [btn(f"📚 {r['name']}", f"u:lectures:s={r['id']}:p=0") for r in rows]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(pagination_row(base_cb="u:subjects", page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(nav_row())
+    if loading_msg:
+        try:
+            await loading_msg.edit_text("📚 اختر المادة:", reply_markup=markup(keyboard))
+        except Exception:
+            await query.message.reply_text("📚 اختر المادة:", reply_markup=markup(keyboard))
+    else:
+        await query.message.reply_text("📚 اختر المادة:", reply_markup=markup(keyboard))
 
-# -----------------------------------------------------------------------------
-# Admin router (keep existing adm_ handlers + new)
-# -----------------------------------------------------------------------------
+
+async def show_lectures(query, subject_id: int, page: int) -> None:
+    PAGE_SIZE = 12
+    offset = page * PAGE_SIZE
+    loading_msg = None
+    try:
+        if LIST_LOADING_EDIT:
+            loading_msg = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
+    except Exception:
+        loading_msg = None
+    async with await db_connect() as conn:
+        async with conn.execute(
+            """
+            SELECT id, title
+            FROM lectures
+            WHERE subject_id=?
+            ORDER BY COALESCE(manual_order, 999999999), created_at, id
+            LIMIT ? OFFSET ?
+            """,
+            (subject_id, PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        if loading_msg:
+            try:
+                await loading_msg.edit_text("📌 لا توجد محاضرات بعد.", reply_markup=markup([nav_row()]))
+            except Exception:
+                await query.message.reply_text("📌 لا توجد محاضرات بعد.", reply_markup=markup([nav_row()]))
+        else:
+            await query.message.reply_text("📌 لا توجد محاضرات بعد.", reply_markup=markup([nav_row()]))
+        return
+
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    buttons = [btn(f"📄 {r['title']}", f"u:lec:id={r['id']}") for r in rows]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(
+        pagination_row(
+            base_cb=f"u:lectures:s={subject_id}",
+            page=page,
+            has_prev=page > 0,
+            has_next=has_next,
+        )
+    )
+    keyboard.append(nav_row())
+    if loading_msg:
+        try:
+            await loading_msg.edit_text("📘 المحاضرات:", reply_markup=markup(keyboard))
+        except Exception:
+            await query.message.reply_text("📘 المحاضرات:", reply_markup=markup(keyboard))
+    else:
+        await query.message.reply_text("📘 المحاضرات:", reply_markup=markup(keyboard))
+
+
+async def show_links(query, page: int) -> None:
+    PAGE_SIZE = 12
+    offset = page * PAGE_SIZE
+    async with await db_connect() as conn:
+        async with conn.execute(
+            """
+            SELECT id, title, url
+            FROM important_links
+            ORDER BY position, id
+            LIMIT ? OFFSET ?
+            """,
+            (PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await query.message.reply_text("📌 لا توجد لينكات بعد.", reply_markup=markup([nav_row()]))
+        return
+
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for r in rows:
+        keyboard.append([url_btn(f"🔗 {r['title']}", r["url"])])
+    keyboard.append(pagination_row(base_cb="u:links", page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(nav_row())
+    await query.message.reply_text("🔗 لينكات مهمة:", reply_markup=markup(keyboard))
+
+
+async def show_latest(query) -> None:
+    async with await db_connect() as conn:
+        async with conn.execute(
+            "SELECT id, title FROM lectures ORDER BY created_at DESC, id DESC LIMIT 10"
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await query.message.reply_text("📌 لا توجد محاضرات بعد.", reply_markup=markup([nav_row()]))
+        return
+    buttons = [btn(f"🆕 {r['title']}", f"u:lec:id={r['id']}") for r in rows]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(nav_row())
+    await query.message.reply_text("🆕 أحدث 10 محاضرات:", reply_markup=markup(keyboard))
+
+
+async def show_search_results(target, query_text: str, page: int, is_message: bool = False) -> None:
+    PAGE_SIZE = 10
+    offset = page * PAGE_SIZE
+    q = query_text.strip()
+    if not q:
+        if is_message:
+            await target.reply_text("⚠️ اكتب كلمة للبحث.", reply_markup=markup([nav_row()]))
+        else:
+            await target.message.reply_text("⚠️ اكتب كلمة للبحث.", reply_markup=markup([nav_row()]))
+        return
+    async with await db_connect() as conn:
+        # Prefer FTS when available; fallback to LIKE
+        try:
+            fts_q = " ".join([p + "*" for p in q.split() if p])
+            if not fts_q:
+                raise ValueError("empty fts query")
+            async with conn.execute(
+                """
+                SELECT l.id, l.title
+                FROM lectures_fts f
+                JOIN lectures l ON l.id = f.rowid
+                WHERE lectures_fts MATCH ?
+                ORDER BY l.created_at DESC, l.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (fts_q, PAGE_SIZE + 1, offset),
+            ) as cur:
+                rows = await cur.fetchall()
+        except Exception:
+            like = f"%{q}%"
+            async with conn.execute(
+                """
+                SELECT id, title
+                FROM lectures
+                WHERE title LIKE ? COLLATE NOCASE
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (like, PAGE_SIZE + 1, offset),
+            ) as cur:
+                rows = await cur.fetchall()
+    if not rows:
+        text = f"🔎 لا توجد نتائج لـ: {q}"
+        if is_message:
+            await target.reply_text(text, reply_markup=markup([nav_row()]))
+        else:
+            await target.message.reply_text(text, reply_markup=markup([nav_row()]))
+        return
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    buttons = [btn(f"🔎 {r['title']}", f"u:lec:id={int(r['id'])}") for r in rows]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(pagination_row(base_cb="u:search_results", page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(nav_row())
+    text = f"🔎 نتائج البحث: {q}"
+    if is_message:
+        await target.reply_text(text, reply_markup=markup(keyboard))
+    else:
+        await target.message.reply_text(text, reply_markup=markup(keyboard))
+
+
+async def show_favorites(query, user_id: int, page: int) -> None:
+    PAGE_SIZE = 12
+    offset = page * PAGE_SIZE
+    async with await db_connect() as conn:
+        async with conn.execute(
+            """
+            SELECT l.id, l.title
+            FROM favorites f
+            JOIN lectures l ON l.id = f.lecture_id
+            WHERE f.user_id=?
+            ORDER BY f.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (user_id, PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await query.message.reply_text("⭐ لا توجد محاضرات في المفضلة بعد.", reply_markup=markup([nav_row()]))
+        return
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    buttons = [btn(f"⭐ {r['title']}", f"u:lec:id={r['id']}") for r in rows]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(pagination_row(base_cb="u:favorites", page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(nav_row())
+    await query.message.reply_text("⭐ المفضلة:", reply_markup=markup(keyboard))
+
+
+# =======================
+# ADMIN HANDLERS (skeleton wired; full flows to be completed in remaining todos)
+
+SORT_PAGE_SIZE = 8
+
+
+async def _ensure_manual_order_subjects() -> None:
+    async with await db_connect() as conn:
+        async with conn.execute(
+            """
+            SELECT id
+            FROM subjects
+            ORDER BY COALESCE(manual_order, 999999999), created_at, id
+            """
+        ) as cur:
+            rows = await cur.fetchall()
+        # If all already have manual_order, keep them as-is
+        if rows:
+            async with conn.execute("SELECT COUNT(*) AS c FROM subjects WHERE manual_order IS NULL") as cur2:
+                c = await cur2.fetchone()
+            if c and int(c["c"]) == 0:
+                return
+        for i, r in enumerate(rows, start=1):
+            await conn.execute("UPDATE subjects SET manual_order=COALESCE(manual_order, ?) WHERE id=?", (i, r["id"]))
+        await conn.commit()
+
+
+async def _ensure_manual_order_lectures(subject_id: int) -> None:
+    async with await db_connect() as conn:
+        async with conn.execute(
+            """
+            SELECT id
+            FROM lectures
+            WHERE subject_id=?
+            ORDER BY COALESCE(manual_order, 999999999), created_at, id
+            """,
+            (subject_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        if rows:
+            async with conn.execute(
+                "SELECT COUNT(*) AS c FROM lectures WHERE subject_id=? AND manual_order IS NULL",
+                (subject_id,),
+            ) as cur2:
+                c = await cur2.fetchone()
+            if c and int(c["c"]) == 0:
+                return
+        for i, r in enumerate(rows, start=1):
+            await conn.execute(
+                "UPDATE lectures SET manual_order=COALESCE(manual_order, ?) WHERE id=? AND subject_id=?",
+                (i, r["id"], subject_id),
+            )
+        await conn.commit()
+
+
+async def _swap_subject_order(subject_id: int, direction: str) -> None:
+    await _ensure_manual_order_subjects()
+    async with await db_connect() as conn:
+        async with conn.execute(
+            "SELECT id, manual_order FROM subjects ORDER BY manual_order, id"
+        ) as cur:
+            rows = await cur.fetchall()
+        ids = [int(r["id"]) for r in rows]
+        if subject_id not in ids:
+            return
+        idx = ids.index(subject_id)
+        if direction == "up" and idx == 0:
+            return
+        if direction == "down" and idx == len(ids) - 1:
+            return
+        swap_idx = idx - 1 if direction == "up" else idx + 1
+        a_id = ids[idx]
+        b_id = ids[swap_idx]
+        a_ord = int(rows[idx]["manual_order"] or idx + 1)
+        b_ord = int(rows[swap_idx]["manual_order"] or swap_idx + 1)
+        await conn.execute("BEGIN")
+        await conn.execute("UPDATE subjects SET manual_order=? WHERE id=?", (b_ord, a_id))
+        await conn.execute("UPDATE subjects SET manual_order=? WHERE id=?", (a_ord, b_id))
+        await conn.commit()
+
+
+async def _swap_lecture_order(subject_id: int, lecture_id: int, direction: str) -> None:
+    await _ensure_manual_order_lectures(subject_id)
+    async with await db_connect() as conn:
+        async with conn.execute(
+            "SELECT id, manual_order FROM lectures WHERE subject_id=? ORDER BY manual_order, id",
+            (subject_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        ids = [int(r["id"]) for r in rows]
+        if lecture_id not in ids:
+            return
+        idx = ids.index(lecture_id)
+        if direction == "up" and idx == 0:
+            return
+        if direction == "down" and idx == len(ids) - 1:
+            return
+        swap_idx = idx - 1 if direction == "up" else idx + 1
+        a_id = ids[idx]
+        b_id = ids[swap_idx]
+        a_ord = int(rows[idx]["manual_order"] or idx + 1)
+        b_ord = int(rows[swap_idx]["manual_order"] or swap_idx + 1)
+        await conn.execute("BEGIN")
+        await conn.execute("UPDATE lectures SET manual_order=? WHERE id=? AND subject_id=?", (b_ord, a_id, subject_id))
+        await conn.execute("UPDATE lectures SET manual_order=? WHERE id=? AND subject_id=?", (a_ord, b_id, subject_id))
+        await conn.commit()
+
+
+async def _admin_show_sort_subjects(query, page: int) -> None:
+    await _ensure_manual_order_subjects()
+    offset = page * SORT_PAGE_SIZE
+    async with await db_connect() as conn:
+        async with conn.execute(
+            """
+            SELECT id, name
+            FROM subjects
+            ORDER BY manual_order, id
+            LIMIT ? OFFSET ?
+            """,
+            (SORT_PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await query.message.reply_text("📌 لا توجد مواد.", reply_markup=markup([nav_row()]))
+        return
+    has_next = len(rows) > SORT_PAGE_SIZE
+    rows = rows[:SORT_PAGE_SIZE]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for r in rows:
+        sid = int(r["id"])
+        keyboard.append(
+            [
+                btn("⬆️", f"a:sort_subjects:move:id={sid}:dir=up:p={page}"),
+                btn(f"📚 {r['name']}", f"a:sort_lectures:subject={sid}:p=0"),
+                btn("⬇️", f"a:sort_subjects:move:id={sid}:dir=down:p={page}"),
+            ]
+        )
+    keyboard.append(pagination_row(base_cb="a:sort_subjects", page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(admin_nav_row())
+    await query.message.reply_text("↕️📚 ترتيب المواد (يدوي):", reply_markup=markup(keyboard))
+
+
+async def _admin_show_sort_lectures(query, subject_id: int, page: int) -> None:
+    await _ensure_manual_order_lectures(subject_id)
+    offset = page * SORT_PAGE_SIZE
+    async with await db_connect() as conn:
+        async with conn.execute("SELECT name FROM subjects WHERE id=?", (subject_id,)) as cur:
+            sub = await cur.fetchone()
+        async with conn.execute(
+            """
+            SELECT id, title
+            FROM lectures
+            WHERE subject_id=?
+            ORDER BY manual_order, id
+            LIMIT ? OFFSET ?
+            """,
+            (subject_id, SORT_PAGE_SIZE + 1, offset),
+        ) as cur2:
+            rows = await cur2.fetchall()
+    if not rows:
+        await query.message.reply_text("📌 لا توجد محاضرات.", reply_markup=markup([nav_row()]))
+        return
+    has_next = len(rows) > SORT_PAGE_SIZE
+    rows = rows[:SORT_PAGE_SIZE]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for r in rows:
+        lid = int(r["id"])
+        keyboard.append(
+            [
+                btn("⬆️", f"a:sort_lectures:move:s={subject_id}:id={lid}:dir=up:p={page}"),
+                btn(f"📄 {r['title']}", f"u:lec:id={lid}"),
+                btn("⬇️", f"a:sort_lectures:move:s={subject_id}:id={lid}:dir=down:p={page}"),
+            ]
+        )
+    keyboard.append(
+        pagination_row(
+            base_cb=f"a:sort_lectures:subject={subject_id}",
+            page=page,
+            has_prev=page > 0,
+            has_next=has_next,
+        )
+    )
+    keyboard.append([btn("⬅️ رجوع لترتيب المواد", "a:sort_subjects:p=0")])
+    keyboard.append(admin_nav_row())
+    sub_name = sub["name"] if sub else str(subject_id)
+    await query.message.reply_text(f"↕️📄 ترتيب المحاضرات (يدوي)\n📚 المادة: {sub_name}", reply_markup=markup(keyboard))
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if not update.effective_user:
         return
-    await update.message.reply_text(
-        "🛠 لوحة التحكم",
-        reply_markup=admin_panel_keyboard(),
-    )
+    if not await is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text("🛠 لوحة التحكم (Admin)", reply_markup=admin_panel_keyboard())
 
 
-async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global BOT_ENABLED
+async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    uid = query.from_user.id
-    if not is_admin(uid):
-        await query.answer("غير مصرّح.", show_alert=True)
+    if not query or not query.from_user:
         return
-    data = query.data or ""
     await query.answer()
+    global BOT_ENABLED
+    uid = query.from_user.id
+    if not await is_admin(uid):
+        return
 
-    if data == "adm_home":
+    if cleanup_expired_upload_session(context):
+        await query.message.reply_text("⌛ انتهت جلسة الرفع. ابدأ من لوحة الأدمن مرة أخرى.", reply_markup=admin_panel_keyboard())
+        return
+
+    data = query.data or ""
+    if data in ("a:panel",):
+        await query.message.reply_text("🛠 لوحة التحكم (Admin)", reply_markup=admin_panel_keyboard())
+        return
+
+    if data == "a:add_subject":
+        context.user_data["admin_mode"] = "add_subject"
+        await query.message.reply_text("➕📚 اكتب اسم المادة الجديدة.", reply_markup=markup([admin_nav_row()]))
+        return
+
+    if data == "a:add_lecture":
+        # Improved: choose subject, then upload documents (multi-upload session)
+        context.user_data["admin_mode"] = "add_lecture_choose_subject"
+        await _admin_choose_subject_for_upload(query, page=0, cb_base="a:add_lecture")
+        return
+
+    if data.startswith("a:add_lecture:p="):
+        page = _parse_page(data)
+        context.user_data["admin_mode"] = "add_lecture_choose_subject"
+        await _admin_choose_subject_for_upload(query, page=page, cb_base="a:add_lecture")
+        return
+
+    if data.startswith("a:add_lecture:subject="):
+        sid = _parse_int_param(data, "subject")
+        if sid is None:
+            return
+        session = UploadSession(mode="add_lecture", subject_id=sid, created_at=int(time.time()))
+        set_upload_session(context, session)
+        # Create a single progress message that we keep editing
+        try:
+            m = await query.message.reply_text(
+                "📦 رفع المحاضرات بدأ...\n✅ Saved: 0\n⚠️ Failed: 0\n\n📤 ارفع الملفات الآن (أي نوع).\nاضغط ✅ تم عند الانتهاء.",
+                reply_markup=markup([[btn("✅ تم", "a:upload_done")], admin_nav_row()]),
+            )
+            session.progress_chat_id = m.chat_id
+            session.progress_message_id = m.message_id
+        except Exception:
+            pass
+        context.user_data["admin_mode"] = "uploading"
+        return
+
+    if data == "a:import_folder":
+        context.user_data["admin_mode"] = "import_folder_ask_subject"
         await query.message.reply_text(
-            "🛠 لوحة التحكم",
+            "📥📁 Import folder\nاكتب اسم المادة وسيتم إنشاؤها تلقائيًا ثم ارفع ملفات متعددة.",
+            reply_markup=markup([admin_nav_row()]),
+        )
+        return
+
+    if data == "a:import_batch":
+        context.user_data["admin_mode"] = "import_batch_choose_subject"
+        await _admin_choose_subject_for_upload(query, page=0, cb_base="a:import_batch")
+        return
+
+    if data.startswith("a:import_batch:p="):
+        page = _parse_page(data)
+        context.user_data["admin_mode"] = "import_batch_choose_subject"
+        await _admin_choose_subject_for_upload(query, page=page, cb_base="a:import_batch")
+        return
+
+    if data.startswith("a:import_batch:subject="):
+        sid = _parse_int_param(data, "subject")
+        if sid is None:
+            return
+        session = UploadSession(mode="import_batch", subject_id=sid, created_at=int(time.time()))
+        set_upload_session(context, session)
+        try:
+            m = await query.message.reply_text(
+                "📦 رفع batch بدأ...\n✅ Saved: 0\n⚠️ Failed: 0\n\n📤 ارفع الملفات الآن.\nاضغط ✅ تم عند الانتهاء.",
+                reply_markup=markup([[btn("✅ تم", "a:upload_done")], admin_nav_row()]),
+            )
+            session.progress_chat_id = m.chat_id
+            session.progress_message_id = m.message_id
+        except Exception:
+            pass
+        context.user_data["admin_mode"] = "uploading"
+        return
+
+    if data == "a:upload_done":
+        session = get_upload_session(context)
+        counters = context.user_data.get("upload_counters") if isinstance(context.user_data.get("upload_counters"), dict) else {}
+        set_upload_session(context, None)
+        context.user_data.pop("admin_mode", None)
+        summary = f"✅ تم إنهاء الرفع.\n✅ Saved: {int(counters.get('saved', 0))}\n⚠️ Failed: {int(counters.get('failed', 0))}"
+        # Try to edit the single progress message if it exists
+        if session and session.progress_chat_id and session.progress_message_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=session.progress_chat_id,
+                    message_id=session.progress_message_id,
+                    text=summary,
+                    reply_markup=admin_panel_keyboard(),
+                )
+                return
+            except Exception:
+                pass
+        await query.message.reply_text(summary, reply_markup=admin_panel_keyboard())
+        return
+
+    # ---- Delete subject ----
+    if data == "a:delete_subject":
+        context.user_data["admin_mode"] = "delete_subject_choose"
+        await _admin_choose_subject_generic(query, page=0, cb_base="a:delete_subject")
+        return
+    if data.startswith("a:delete_subject:p="):
+        await _admin_choose_subject_generic(query, page=_parse_page(data), cb_base="a:delete_subject")
+        return
+    if data.startswith("a:delete_subject:subject="):
+        sid = _parse_int_param(data, "subject")
+        if sid is None:
+            return
+        await query.message.reply_text(
+            "⚠️ تأكيد حذف المادة؟ سيتم حذف كل محاضراتها أيضًا.",
+            reply_markup=markup([[btn("🗑️ تأكيد الحذف", f"a:delete_subject_confirm:id={sid}")], admin_nav_row()]),
+        )
+        return
+    if data.startswith("a:delete_subject_confirm:"):
+        sid = _parse_int_param(data, "id")
+        if sid is None:
+            return
+        async with await db_connect() as conn:
+            await conn.execute("DELETE FROM lectures WHERE subject_id=?", (sid,))
+            await conn.execute("DELETE FROM subjects WHERE id=?", (sid,))
+            await conn.commit()
+        save_db()
+        await query.message.reply_text("✅ تم حذف المادة.", reply_markup=admin_panel_keyboard())
+        return
+
+    # ---- Delete lecture ----
+    if data == "a:delete_lecture":
+        context.user_data["admin_mode"] = "delete_lecture_choose_subject"
+        await _admin_choose_subject_generic(query, page=0, cb_base="a:delete_lecture")
+        return
+    if data.startswith("a:delete_lecture:p="):
+        await _admin_choose_subject_generic(query, page=_parse_page(data), cb_base="a:delete_lecture")
+        return
+    if data.startswith("a:delete_lecture:subject="):
+        sid = _parse_int_param(data, "subject")
+        if sid is None:
+            return
+        await _admin_choose_lecture(query, subject_id=sid, page=0, cb_base=f"a:delete_lecture_list:s={sid}")
+        return
+    if data.startswith("a:delete_lecture_list:s="):
+        sid = _parse_int_param(data, "s")
+        page = _parse_page(data)
+        if sid is None:
+            return
+        await _admin_choose_lecture(query, subject_id=sid, page=page, cb_base=f"a:delete_lecture_list:s={sid}")
+        return
+    if data.startswith("a:delete_lecture_pick:s="):
+        sid = _parse_int_param(data, "s")
+        lid = _parse_int_param(data, "id")
+        if sid is None or lid is None:
+            return
+        await query.message.reply_text(
+            "⚠️ تأكيد حذف المحاضرة؟",
+            reply_markup=markup([[btn("🗑️ تأكيد الحذف", f"a:delete_lecture_confirm:s={sid}:id={lid}")], admin_nav_row()]),
+        )
+        return
+    if data.startswith("a:delete_lecture_confirm:"):
+        sid = _parse_int_param(data, "s")
+        lid = _parse_int_param(data, "id")
+        if sid is None or lid is None:
+            return
+        async with await db_connect() as conn:
+            await conn.execute("DELETE FROM favorites WHERE lecture_id=?", (lid,))
+            await conn.execute("DELETE FROM lectures WHERE id=? AND subject_id=?", (lid, sid))
+            await conn.commit()
+        save_db()
+        await query.message.reply_text("✅ تم حذف المحاضرة.", reply_markup=admin_panel_keyboard())
+        return
+
+    # ---- Edit subject name ----
+    if data == "a:edit_subject":
+        context.user_data["admin_mode"] = "edit_subject_choose"
+        await _admin_choose_subject_generic(query, page=0, cb_base="a:edit_subject")
+        return
+    if data.startswith("a:edit_subject:p="):
+        await _admin_choose_subject_generic(query, page=_parse_page(data), cb_base="a:edit_subject")
+        return
+    if data.startswith("a:edit_subject:subject="):
+        sid = _parse_int_param(data, "subject")
+        if sid is None:
+            return
+        context.user_data["admin_mode"] = "edit_subject_wait_name"
+        context.user_data["edit_subject_id"] = sid
+        await query.message.reply_text("✏️ اكتب الاسم الجديد للمادة.", reply_markup=markup([admin_nav_row()]))
+        return
+
+    # ---- Edit lecture title ----
+    if data == "a:edit_lecture":
+        context.user_data["admin_mode"] = "edit_lecture_choose_subject"
+        await _admin_choose_subject_generic(query, page=0, cb_base="a:edit_lecture")
+        return
+    if data.startswith("a:edit_lecture:p="):
+        await _admin_choose_subject_generic(query, page=_parse_page(data), cb_base="a:edit_lecture")
+        return
+    if data.startswith("a:edit_lecture:subject="):
+        sid = _parse_int_param(data, "subject")
+        if sid is None:
+            return
+        await _admin_choose_lecture(query, subject_id=sid, page=0, cb_base=f"a:edit_lecture_list:s={sid}")
+        return
+    if data.startswith("a:edit_lecture_list:s="):
+        sid = _parse_int_param(data, "s")
+        page = _parse_page(data)
+        if sid is None:
+            return
+        await _admin_choose_lecture(query, subject_id=sid, page=page, cb_base=f"a:edit_lecture_list:s={sid}")
+        return
+    if data.startswith("a:edit_lecture_pick:s="):
+        sid = _parse_int_param(data, "s")
+        lid = _parse_int_param(data, "id")
+        if sid is None or lid is None:
+            return
+        context.user_data["admin_mode"] = "edit_lecture_wait_title"
+        context.user_data["edit_lecture_subject_id"] = sid
+        context.user_data["edit_lecture_id"] = lid
+        await query.message.reply_text("✏️ اكتب العنوان الجديد للمحاضرة.", reply_markup=markup([admin_nav_row()]))
+        return
+
+    # ---- Manage links ----
+    if data == "a:manage_links":
+        await _admin_show_links_manage(query, page=0)
+        return
+    if data.startswith("a:manage_links:p="):
+        await _admin_show_links_manage(query, page=_parse_page(data))
+        return
+    if data == "a:links_reorder_init":
+        await _ensure_links_positions()
+        save_db()
+        await query.message.reply_text("✅ تم تجهيز ترتيب الروابط.", reply_markup=admin_panel_keyboard())
+        return
+    if data.startswith("a:links_move:"):
+        lid = _parse_int_param(data, "id")
+        direction = "up" if "dir=up" in data else "down"
+        page = _parse_page(data)
+        if lid is not None:
+            await _swap_link_position(lid, direction)
+            save_db()
+        await _admin_show_links_manage(query, page=page)
+        return
+    if data == "a:links_add":
+        context.user_data["admin_mode"] = "links_add_title"
+        await query.message.reply_text("➕ اكتب عنوان اللينك.", reply_markup=markup([admin_nav_row()]))
+        return
+    if data.startswith("a:links_del:id="):
+        lid = _parse_int_param(data, "id")
+        if lid is None:
+            return
+        async with await db_connect() as conn:
+            await conn.execute("DELETE FROM important_links WHERE id=?", (lid,))
+            await conn.commit()
+        save_db()
+        await query.message.reply_text("✅ تم حذف اللينك.", reply_markup=admin_panel_keyboard())
+        return
+
+    # ---- Broadcast ----
+    if data == "a:broadcast":
+        context.user_data["admin_mode"] = "broadcast_text"
+        await query.message.reply_text("📢 اكتب رسالة البرودكاست.", reply_markup=markup([admin_nav_row()]))
+        return
+
+    # ---- Clean data ----
+    if data == "a:clean":
+        async with await db_connect() as conn:
+            # remove favorites pointing to missing lectures
+            await conn.execute(
+                "DELETE FROM favorites WHERE lecture_id NOT IN (SELECT id FROM lectures)"
+            )
+            await conn.commit()
+        save_db()
+        await query.message.reply_text("🧹 تم تنظيف البيانات الأساسية.", reply_markup=admin_panel_keyboard())
+        return
+
+    # ---- Manage admins ----
+    if data == "a:manage_admins":
+        await _admin_show_admins(query)
+        return
+    if data == "a:admins_add":
+        context.user_data["admin_mode"] = "admins_add_user_id"
+        await query.message.reply_text("👮 اكتب User ID لإضافته كأدمن.", reply_markup=markup([admin_nav_row()]))
+        return
+    if data.startswith("a:admins_del:id="):
+        aid = _parse_int_param(data, "id")
+        if aid is None:
+            return
+        if aid == MAIN_ADMIN_ID:
+            await query.message.reply_text("⚠️ لا يمكن حذف الأدمن الرئيسي.", reply_markup=admin_panel_keyboard())
+            return
+        async with await db_connect() as conn:
+            await conn.execute("DELETE FROM admins WHERE user_id=?", (aid,))
+            await conn.commit()
+        save_db()
+        await query.message.reply_text("✅ تم حذف الأدمن.", reply_markup=admin_panel_keyboard())
+        return
+    if data == "a:user_search":
+        context.user_data["admin_mode"] = "user_search"
+        await query.message.reply_text("🔎 اكتب User ID أو username للبحث.", reply_markup=markup([admin_nav_row()]))
+        return
+
+    if data == "a:backup":
+        save_db()
+        await query.message.reply_text("✅ تم عمل نسخة احتياطية للقاعدة.", reply_markup=admin_panel_keyboard())
+        return
+
+    if data == "a:stats":
+        async with await db_connect() as conn:
+            async with conn.execute("SELECT COUNT(*) AS c FROM users") as cur1:
+                users_c = int((await cur1.fetchone())["c"])
+            async with conn.execute("SELECT COUNT(*) AS c FROM subjects") as cur2:
+                sub_c = int((await cur2.fetchone())["c"])
+            async with conn.execute("SELECT COUNT(*) AS c FROM lectures") as cur3:
+                lec_c = int((await cur3.fetchone())["c"])
+            async with conn.execute("SELECT COUNT(*) AS c FROM uploads") as cur4:
+                up_c = int((await cur4.fetchone())["c"])
+        await query.message.reply_text(
+            "📊 Statistics\n"
+            f"👥 Users: {users_c}\n"
+            f"📚 Subjects: {sub_c}\n"
+            f"📄 Lectures: {lec_c}\n"
+            f"📤 Uploads: {up_c}",
             reply_markup=admin_panel_keyboard(),
         )
         return
 
-    if data == "adm_add_subject":
-        context.user_data.clear()
-        context.user_data["waiting_subject"] = True
-        await query.message.reply_text("✏️ اكتب اسم المادة:")
-        return
-
-    if data == "adm_add_lecture":
-        context.user_data.clear()
-        c = get_connection().cursor()
-        c.execute("SELECT id, name FROM subjects ORDER BY sort_order, name")
-        subs = c.fetchall()
-        if not subs:
-            await query.message.reply_text("📌 لا توجد مواد.")
-            return
-        kb = [
-            [InlineKeyboardButton(n, callback_data=f"adm_choose_lec_{sid}")]
-            for sid, n in subs
-        ]
-        await query.message.reply_text("📚 اختر المادة:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("adm_choose_lec_"):
-        sid = int(data.replace("adm_choose_lec_", ""))
-        context.user_data["add_lec_subject"] = sid
-        await query.message.reply_text(
-            "أرسل عنوانًا نصيًا اختياريًا، ثم أرسل **أي ملف** (أو أرسل الملف مباشرة — العنوان من الاسم).",
-            parse_mode="Markdown",
-        )
-        return
-
-    if data == "adm_import_folder":
-        base = _default_import_base()
-        pm = await query.message.reply_text(f"⏳ استيراد مجلد:\n{base}")
-        async def prog(t: str) -> None:
-            try:
-                await pm.edit_text(t[:4000])
-            except Exception:
-                pass
-        await import_lectures_from_folders(base, context.bot, uid, prog)
-        log_admin_action(uid, "import_folder")
-        return
-
-    if data == "adm_import":
-        base = _default_import_base()
-        pm = await query.message.reply_text(f"⏳ استيراد دفعة من:\n{base}")
-        async def prog(t: str) -> None:
-            try:
-                await pm.edit_text(t[:4000])
-            except Exception:
-                pass
-        await import_lectures_from_folders(base, context.bot, uid, prog)
-        log_admin_action(uid, "import_batch")
-        return
-
-    if data == "adm_sort_subjects":
-        c = get_connection().cursor()
-        c.execute("SELECT id, name FROM subjects ORDER BY sort_order, name")
-        subs = c.fetchall()
-        if not subs:
-            await query.message.reply_text("📌 لا توجد مواد.")
-            return
-        kb = []
-        for i, (sid, name) in enumerate(subs):
-            row = [
-                InlineKeyboardButton("⬆️", callback_data=f"adm_sort_up_{sid}"),
-                InlineKeyboardButton(name[:35], callback_data="adm_noop"),
-                InlineKeyboardButton("⬇️", callback_data=f"adm_sort_dn_{sid}"),
-            ]
-            kb.append(row)
-        kb.append([InlineKeyboardButton("🏠 رجوع", callback_data="adm_home")])
-        await query.message.reply_text(
-            "⬆️⬇️ ترتيب المواد (تبديل مع الجار):",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-        return
-
-    if data == "adm_noop":
-        return
-
-    if data.startswith("adm_sort_up_"):
-        sid = int(data.replace("adm_sort_up_", ""))
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("SELECT sort_order FROM subjects WHERE id = ?", (sid,))
-        cur = c.fetchone()
-        if not cur:
-            return
-        so = cur[0]
-        c.execute(
-            "SELECT id, sort_order FROM subjects WHERE sort_order < ? ORDER BY sort_order DESC LIMIT 1",
-            (so,),
-        )
-        prev = c.fetchone()
-        if prev:
-            c.execute("UPDATE subjects SET sort_order = ? WHERE id = ?", (prev[1], sid))
-            c.execute("UPDATE subjects SET sort_order = ? WHERE id = ?", (so, prev[0]))
-            commit_and_backup(conn)
-            cache_invalidate()
-        await query.message.reply_text("✅ تم تعديل الترتيب. افتح ترتيب المواد مجددًا إن لزم.")
-        return
-
-    if data.startswith("adm_sort_dn_"):
-        sid = int(data.replace("adm_sort_dn_", ""))
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("SELECT sort_order FROM subjects WHERE id = ?", (sid,))
-        cur = c.fetchone()
-        if not cur:
-            return
-        so = cur[0]
-        c.execute(
-            "SELECT id, sort_order FROM subjects WHERE sort_order > ? ORDER BY sort_order ASC LIMIT 1",
-            (so,),
-        )
-        nxt = c.fetchone()
-        if nxt:
-            c.execute("UPDATE subjects SET sort_order = ? WHERE id = ?", (nxt[1], sid))
-            c.execute("UPDATE subjects SET sort_order = ? WHERE id = ?", (so, nxt[0]))
-            commit_and_backup(conn)
-            cache_invalidate()
-        await query.message.reply_text("✅ تم تعديل الترتيب.")
-        return
-
-    if data == "adm_cleanup":
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("DELETE FROM favorites WHERE lecture_id NOT IN (SELECT id FROM lectures)")
-        c.execute("VACUUM")
-        commit_and_backup(conn)
-        optional_github_backup()
-        await query.message.reply_text("🧹 تم تنظيف المفضلة اليتيمة وتنفيذ VACUUM.")
-        log_admin_action(uid, "cleanup")
-        return
-
-    if data == "adm_del_subject":
-        c = get_connection().cursor()
-        c.execute("SELECT id, name FROM subjects ORDER BY sort_order, name")
-        subs = c.fetchall()
-        if not subs:
-            await query.message.reply_text("📌 لا توجد مواد.")
-            return
-        kb = [
-            [InlineKeyboardButton(n, callback_data=f"adm_confirm_del_sub_{sid}")]
-            for sid, n in subs
-        ]
-        await query.message.reply_text("🗑 اختر مادة للحذف:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("adm_confirm_del_sub_"):
-        sid = int(data.replace("adm_confirm_del_sub_", ""))
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("DELETE FROM lectures WHERE subject_id = ?", (sid,))
-        c.execute("DELETE FROM subjects WHERE id = ?", (sid,))
-        commit_and_backup(conn)
-        cache_invalidate()
-        await query.message.reply_text("✅ تم الحذف.")
-        log_admin_action(uid, f"del_sub {sid}")
-        return
-
-    if data == "adm_del_lecture":
-        c = get_connection().cursor()
-        c.execute("SELECT id, name FROM subjects ORDER BY sort_order, name")
-        subs = c.fetchall()
-        kb = [
-            [InlineKeyboardButton(n, callback_data=f"adm_pick_del_lec_sub_{sid}")]
-            for sid, n in subs
-        ]
-        await query.message.reply_text("اختر المادة:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("adm_pick_del_lec_sub_"):
-        sid = int(data.replace("adm_pick_del_lec_sub_", ""))
-        c = get_connection().cursor()
-        c.execute(
-            "SELECT id, title FROM lectures WHERE subject_id = ? ORDER BY title",
-            (sid,),
-        )
-        lecs = c.fetchall()
-        if not lecs:
-            await query.message.reply_text("📌 لا محاضرات.")
-            return
-        kb = [
-            [InlineKeyboardButton(t[:58], callback_data=f"adm_confirm_del_lec_{lid}")]
-            for lid, t in lecs
-        ]
-        await query.message.reply_text("🗑 اختر محاضرة:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("adm_confirm_del_lec_"):
-        lid = int(data.replace("adm_confirm_del_lec_", ""))
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("DELETE FROM lectures WHERE id = ?", (lid,))
-        commit_and_backup(conn)
-        cache_invalidate()
-        await query.message.reply_text("✅ تم حذف المحاضرة.")
-        log_admin_action(uid, f"del_lec {lid}")
-        return
-
-    if data == "adm_edit_subject":
-        c = get_connection().cursor()
-        c.execute("SELECT id, name FROM subjects ORDER BY sort_order, name")
-        subs = c.fetchall()
-        kb = [
-            [InlineKeyboardButton(n, callback_data=f"adm_edit_subj_{sid}")]
-            for sid, n in subs
-        ]
-        await query.message.reply_text("اختر مادة:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("adm_edit_subj_"):
-        sid = int(data.replace("adm_edit_subj_", ""))
-        context.user_data.clear()
-        context.user_data["edit_subject_id"] = sid
-        await query.message.reply_text("اكتب الاسم الجديد:")
-        return
-
-    if data == "adm_edit_lecture":
-        c = get_connection().cursor()
-        c.execute("SELECT id, name FROM subjects ORDER BY sort_order, name")
-        subs = c.fetchall()
-        kb = [
-            [InlineKeyboardButton(n, callback_data=f"adm_edit_lec_sub_{sid}")]
-            for sid, n in subs
-        ]
-        await query.message.reply_text("اختر المادة:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("adm_edit_lec_sub_"):
-        sid = int(data.replace("adm_edit_lec_sub_", ""))
-        c = get_connection().cursor()
-        c.execute(
-            "SELECT id, title FROM lectures WHERE subject_id = ? ORDER BY title",
-            (sid,),
-        )
-        lecs = c.fetchall()
-        kb = [
-            [InlineKeyboardButton(t[:58], callback_data=f"adm_edit_lec_id_{lid}")]
-            for lid, t in lecs
-        ]
-        await query.message.reply_text("اختر محاضرة:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("adm_edit_lec_id_"):
-        lid = int(data.replace("adm_edit_lec_id_", ""))
-        context.user_data.clear()
-        context.user_data["edit_lecture_id"] = lid
-        await query.message.reply_text("عنوان جديد:")
-        return
-
-    if data == "adm_links":
-        c = get_connection().cursor()
-        c.execute("SELECT id, title, url, position FROM important_links ORDER BY position, id")
-        rows = c.fetchall()
-        txt = "\n".join(f"{p}. {t} — {u}" for _, t, u, p in rows) if rows else "لا لينكات."
-        kb = [
-            [InlineKeyboardButton("➕ إضافة", callback_data="adm_link_add")],
-            [InlineKeyboardButton("🗑 حذف", callback_data="adm_link_del_pick")],
-            [InlineKeyboardButton("🏠 رجوع", callback_data="adm_home")],
-        ]
-        await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data == "adm_link_add":
-        context.user_data.clear()
-        context.user_data["link_add_step"] = "title"
-        await query.message.reply_text("عنوان اللينك:")
-        return
-
-    if data == "adm_link_del_pick":
-        c = get_connection().cursor()
-        c.execute("SELECT id, title FROM important_links ORDER BY position, id")
-        rows = c.fetchall()
-        if not rows:
-            await query.message.reply_text("لا شيء للحذف.")
-            return
-        kb = [
-            [InlineKeyboardButton(t[:50], callback_data=f"adm_link_del_{lid}")]
-            for lid, t in rows
-        ]
-        await query.message.reply_text("اختر لينكًا:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("adm_link_del_") and not data.startswith("adm_link_del_pick"):
-        lid = int(data.replace("adm_link_del_", ""))
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("DELETE FROM important_links WHERE id = ?", (lid,))
-        commit_and_backup(conn)
-        await query.message.reply_text("✅ تم.")
-        return
-
-    if data == "adm_broadcast":
-        context.user_data.clear()
-        context.user_data["broadcast_wait"] = True
-        await query.message.reply_text(
-            "📢 أرسل أي رسالة (نص، صورة، ملف، صوت، فيديو، ملصق...)"
-        )
-        return
-
-    if data == "adm_stats":
-        st = stats_bundle()
-        await query.message.reply_text(
-            "📊 **إحصائيات المشرف**\n"
-            f"👥 مستخدمون: {st['users']}\n"
-            f"📚 مواد: {st['subjects']}\n"
-            f"📄 محاضرات: {st['lectures']}\n"
-            f"⭐ مفضلة: {st['favorites']}\n"
-            f"🏆 أكثر مادة تحميلًا: {st['top_subject'][0]} ({st['top_subject'][1]})\n"
-            f"🏆 أكثر محاضرة: {st['top_lecture'][0]} ({st['top_lecture'][1]} تحميل)\n",
-            parse_mode="Markdown",
-        )
-        return
-
-    if data == "adm_backup":
-        try:
-            path = admin_backup_timestamped()
-            await query.message.reply_text(f"📦 تم النسخ:\n{path}")
-            await send_db_to_admins(context.bot)
-            log_admin_action(uid, "backup")
-        except OSError as e:
-            await query.message.reply_text(f"❌ {e}")
-        return
-
-    if data == "adm_stop":
+    if data == "a:stop":
         BOT_ENABLED = False
-        await query.message.reply_text("⏸ تم إيقاف البوت للطلاب.")
-        log_admin_action(uid, "stop")
+        await query.message.reply_text("⛔ تم إيقاف البوت للمستخدمين (وضع صيانة).", reply_markup=admin_panel_keyboard())
         return
 
-    if data == "adm_start":
+    if data == "a:start":
         BOT_ENABLED = True
-        await query.message.reply_text("▶️ تم التشغيل.")
-        log_admin_action(uid, "start")
+        await query.message.reply_text("✅ تم تشغيل البوت للمستخدمين.", reply_markup=admin_panel_keyboard())
         return
 
-    if data == "adm_admins":
-        if not is_main_admin(uid):
-            await query.message.reply_text("⛔ للمشرف الرئيسي فقط.")
+    # ---- Sorting (manual reorder) ----
+    if data.startswith("a:sort_subjects"):
+        page = _parse_page(data)
+        await _admin_show_sort_subjects(query, page=page)
+        return
+
+    if data.startswith("a:sort_subjects:move:"):
+        sid = _parse_int_param(data, "id")
+        direction = "up" if "dir=up" in data else "down"
+        page = _parse_page(data)
+        if sid is not None:
+            await _swap_subject_order(sid, direction)
+            save_db()
+        await _admin_show_sort_subjects(query, page=page)
+        return
+
+    if data.startswith("a:sort_lectures:subject="):
+        sid = _parse_int_param(data, "subject")
+        page = _parse_page(data)
+        if sid is None:
             return
-        extras = get_extra_admins()
-        lines = [f"👑 `{MAIN_ADMIN_ID}`", "المشرفون الإضافيون:"]
-        for e in extras:
-            lines.append(f"• `{e}` — /remove_admin {e}")
-        if not extras:
-            lines.append("(لا يوجد)")
-        kb = [
-            [InlineKeyboardButton("➕ إضافة مشرف", callback_data="adm_admin_add")],
-            [InlineKeyboardButton("🏠 رجوع", callback_data="adm_home")],
-        ]
-        await query.message.reply_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
+        await _admin_show_sort_lectures(query, subject_id=sid, page=page)
         return
 
-    if data == "adm_admin_add":
-        if not is_main_admin(uid):
-            return
-        context.user_data.clear()
-        context.user_data["admin_add_wait"] = True
-        await query.message.reply_text("أرسل user id:")
+    if data.startswith("a:sort_lectures:move:"):
+        sid = _parse_int_param(data, "s")
+        lid = _parse_int_param(data, "id")
+        direction = "up" if "dir=up" in data else "down"
+        page = _parse_page(data)
+        if sid is not None and lid is not None:
+            await _swap_lecture_order(sid, lid, direction)
+            save_db()
+        await _admin_show_sort_lectures(query, subject_id=sid or 0, page=page)
         return
 
-
-# -----------------------------------------------------------------------------
-# Broadcast first — any message type
-# -----------------------------------------------------------------------------
+    # required buttons exist; wiring/logic will be implemented in next steps
+    await query.message.reply_text("⏳ قيد التطوير الآن…", reply_markup=markup([admin_nav_row()]))
 
 
-async def admin_broadcast_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
         return
-    if not context.user_data.get("broadcast_wait"):
-        return
-    if not update.message:
-        return
-    context.user_data["broadcast_wait"] = False
-    uids = get_all_user_ids()
-    ok = fail = 0
-    from_chat = update.effective_chat.id
-    mid = update.message.message_id
-    await update.message.reply_text(f"⏳ جاري الإرسال إلى {len(uids)} مستخدم...")
-    for ouid in uids:
-        try:
-            await context.bot.copy_message(
-                chat_id=ouid,
-                from_chat_id=from_chat,
-                message_id=mid,
-            )
-            ok += 1
-        except Exception as e:
-            fail += 1
-            logger.debug("bc fail %s: %s", ouid, e)
-        await asyncio.sleep(BROADCAST_DELAY)
-    await update.message.reply_text(
-        f"تم الإرسال بنجاح: {ok}\nفشل الإرسال: {fail}"
-    )
-    context.user_data["broadcast_handled"] = True
-    log_admin_action(update.effective_user.id, "broadcast")
-
-
-# -----------------------------------------------------------------------------
-# Admin text / media
-# -----------------------------------------------------------------------------
-
-
-async def admin_handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    if not is_admin(uid):
+    if not await is_admin(uid):
         return
-    if context.user_data.pop("broadcast_handled", False):
-        return
-    if context.user_data.get("broadcast_wait"):
-        return
+    cleanup_expired_upload_session(context)
+    mode = context.user_data.get("admin_mode")
     text = (update.message.text or "").strip()
+    if not text:
+        return
 
-    if context.user_data.get("waiting_subject"):
-        if not text:
-            await update.message.reply_text("❌ فارغ.")
-            return
-        conn = get_connection()
-        c = conn.cursor()
-        try:
-            c.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM subjects")
-            nxt = int(c.fetchone()[0])
-            c.execute(
-                "INSERT INTO subjects(name, sort_order) VALUES (?, ?)",
-                (text, nxt),
+    if mode == "add_subject":
+        now = int(time.time())
+        async with await db_connect() as conn:
+            try:
+                await conn.execute(
+                    "INSERT INTO subjects(name, created_at) VALUES(?, ?)",
+                    (text, now),
+                )
+                await conn.commit()
+            except Exception:
+                await update.message.reply_text("⚠️ لم أستطع إضافة المادة (قد تكون موجودة بالفعل).")
+                return
+        save_db()
+        context.user_data.pop("admin_mode", None)
+        await update.message.reply_text("✅ تم إضافة المادة.", reply_markup=admin_panel_keyboard())
+        return
+
+    if mode == "import_folder_ask_subject":
+        subject_name = text
+        now = int(time.time())
+        async with await db_connect() as conn:
+            # create subject if missing
+            await conn.execute(
+                "INSERT OR IGNORE INTO subjects(name, created_at) VALUES(?, ?)",
+                (subject_name, now),
             )
-            commit_and_backup(conn)
-        except sqlite3.IntegrityError:
-            await update.message.reply_text("❌ موجودة مسبقًا.")
+            await conn.commit()
+            async with conn.execute("SELECT id FROM subjects WHERE name=?", (subject_name,)) as cur:
+                row = await cur.fetchone()
+        if not row:
+            await update.message.reply_text("⚠️ لم أستطع إنشاء المادة.", reply_markup=admin_panel_keyboard())
             return
-        context.user_data.clear()
-        cache_invalidate()
-        await update.message.reply_text("✅ تمت إضافة المادة.")
-        return
-
-    if context.user_data.get("add_lec_subject") is not None and context.user_data.get("lecture_title") is None:
-        context.user_data["lecture_title"] = text
-        await update.message.reply_text("📤 أرسل الملف الآن (أي نوع مدعوم).")
-        return
-
-    if context.user_data.get("edit_subject_id") is not None:
-        sid = context.user_data["edit_subject_id"]
-        conn = get_connection()
-        c = conn.cursor()
+        sid = int(row["id"])
+        await _ensure_manual_order_subjects()
+        session = UploadSession(mode="import_folder", subject_id=sid, created_at=int(time.time()))
+        set_upload_session(context, session)
+        context.user_data["admin_mode"] = "uploading"
+        save_db()
         try:
-            c.execute("UPDATE subjects SET name = ? WHERE id = ?", (text, sid))
-            commit_and_backup(conn)
-        except sqlite3.IntegrityError:
-            await update.message.reply_text("❌ الاسم مستخدم.")
-            return
-        context.user_data.clear()
-        cache_invalidate()
-        await update.message.reply_text("✅ تم.")
-        return
-
-    if context.user_data.get("edit_lecture_id") is not None:
-        lid = context.user_data["edit_lecture_id"]
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("UPDATE lectures SET title = ? WHERE id = ?", (text, lid))
-        commit_and_backup(conn)
-        context.user_data.clear()
-        cache_invalidate()
-        await update.message.reply_text("✅ تم.")
-        return
-
-    if context.user_data.get("link_add_step") == "title":
-        context.user_data["link_title"] = text
-        context.user_data["link_add_step"] = "url"
-        await update.message.reply_text("الرابط:")
-        return
-
-    if context.user_data.get("link_add_step") == "url":
-        title = context.user_data.get("link_title", "")
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("SELECT COALESCE(MAX(position),0)+1 FROM important_links")
-        pos = c.fetchone()[0]
-        c.execute(
-            "INSERT INTO important_links(title, url, position) VALUES (?,?,?)",
-            (title, text, pos),
-        )
-        commit_and_backup(conn)
-        context.user_data.clear()
-        await update.message.reply_text("✅ تم.")
-        return
-
-    if context.user_data.get("admin_add_wait") and is_main_admin(uid):
-        if not text.isdigit():
-            await update.message.reply_text("أرقام فقط.")
-            return
-        nid = int(text)
-        if add_admin_user(nid):
-            context.user_data.clear()
-            await update.message.reply_text(f"✅ أُضيف {nid}")
-        else:
-            await update.message.reply_text("موجود أو غير صالح.")
-        return
-
-
-async def admin_handle_any_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add lecture: any file sent as document (filters.Document.ALL)."""
-    uid = update.effective_user.id
-    if not is_admin(uid):
-        return
-    if context.user_data.pop("broadcast_handled", False):
-        return
-    if context.user_data.get("broadcast_wait"):
-        return
-    if context.user_data.get("add_lec_subject") is None:
-        return
-    msg = update.message
-    if not msg.document:
-        return
-    fid = msg.document.file_id
-    ctype = "document"
-    sid = context.user_data["add_lec_subject"]
-    title = context.user_data.get("lecture_title")
-    if title:
-        title = title.strip()
-    if not title:
-        fn = msg.document.file_name or "file"
-        title = extract_lecture_title_from_filename(fn) or "محاضرة"
-    if lecture_exists(sid, title):
-        context.user_data.clear()
-        await msg.reply_text("⏭ موجودة مسبقًا.")
-        return
-    insert_lecture_full(sid, title, fid, ctype)
-    context.user_data.clear()
-    await msg.reply_text(f"✅ أُضيفت: {title}")
-
-
-async def handle_public_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    if is_admin(uid):
-        return
-    if not BOT_ENABLED:
-        await update.message.reply_text(MAINTENANCE_MESSAGE)
-        return
-    if context.user_data.get("search_mode"):
-        q = (update.message.text or "").strip()
-        context.user_data.pop("search_mode", None)
-        res = search_lectures(q)
-        if not res:
+            m = await update.message.reply_text(
+                f"✅ تم تجهيز المادة: {subject_name}\n\n📦 رفع الملفات بدأ...\n✅ Saved: 0\n⚠️ Failed: 0\n\n📤 ارفع الملفات الآن.\nاضغط ✅ تم عند الانتهاء.",
+                reply_markup=markup([[btn("✅ تم", "a:upload_done")], admin_nav_row()]),
+            )
+            session.progress_chat_id = m.chat_id
+            session.progress_message_id = m.message_id
+        except Exception:
             await update.message.reply_text(
-                "🔍 لا نتائج.",
-                reply_markup=kb_back_home(),
+                f"✅ تم تجهيز المادة: {subject_name}\n📤 ارفع الملفات الآن.\nاضغط ✅ تم عند الانتهاء.",
+                reply_markup=markup([[btn("✅ تم", "a:upload_done")], admin_nav_row()]),
             )
+        return
+
+    if mode == "edit_subject_wait_name":
+        sid = context.user_data.get("edit_subject_id")
+        if not isinstance(sid, int):
             return
-        kb = []
-        for lid, title, sname in res[:30]:
-            kb.append(
-                [
-                    InlineKeyboardButton(
-                        f"{title[:40]} — {sname[:18]}",
-                        callback_data=f"u_get_{lid}",
-                    )
-                ]
+        async with await db_connect() as conn:
+            try:
+                await conn.execute("UPDATE subjects SET name=? WHERE id=?", (text, sid))
+                await conn.commit()
+            except Exception:
+                await update.message.reply_text("⚠️ لم أستطع تعديل الاسم (قد يكون موجود).")
+                return
+        save_db()
+        context.user_data.pop("admin_mode", None)
+        context.user_data.pop("edit_subject_id", None)
+        await update.message.reply_text("✅ تم تعديل اسم المادة.", reply_markup=admin_panel_keyboard())
+        return
+
+    if mode == "edit_lecture_wait_title":
+        sid = context.user_data.get("edit_lecture_subject_id")
+        lid = context.user_data.get("edit_lecture_id")
+        if not isinstance(sid, int) or not isinstance(lid, int):
+            return
+        # Duplicate protection (per-subject) for edited titles
+        async with await db_connect() as conn:
+            async with conn.execute(
+                "SELECT 1 FROM lectures WHERE subject_id=? AND title=? AND id<>?",
+                (sid, text, lid),
+            ) as cur:
+                exists = await cur.fetchone()
+            new_title = text
+            if exists:
+                base, ext = _split_filename(text)
+                i = 2
+                while True:
+                    cand = f"{base} ({i}){ext}"
+                    async with conn.execute(
+                        "SELECT 1 FROM lectures WHERE subject_id=? AND title=?",
+                        (sid, cand),
+                    ) as cur2:
+                        if not await cur2.fetchone():
+                            new_title = cand
+                            break
+                    i += 1
+            await conn.execute(
+                "UPDATE lectures SET title=? WHERE id=? AND subject_id=?",
+                (new_title, lid, sid),
             )
-        kb.append([InlineKeyboardButton("🏠 الرئيسية", callback_data="u_home")])
+            await conn.commit()
+        save_db()
+        context.user_data.pop("admin_mode", None)
+        context.user_data.pop("edit_lecture_subject_id", None)
+        context.user_data.pop("edit_lecture_id", None)
+        await update.message.reply_text("✅ تم تعديل عنوان المحاضرة.", reply_markup=admin_panel_keyboard())
+        return
+
+    if mode == "links_add_title":
+        context.user_data["links_new_title"] = text
+        context.user_data["admin_mode"] = "links_add_url"
+        await update.message.reply_text("🔗 اكتب رابط URL.", reply_markup=markup([admin_nav_row()]))
+        return
+
+    if mode == "links_add_url":
+        title = context.user_data.get("links_new_title")
+        url = text
+        if not isinstance(title, str) or not url:
+            return
+        async with await db_connect() as conn:
+            await conn.execute(
+                "INSERT INTO important_links(title, url, position) VALUES(?,?,?)",
+                (title, url, 999),
+            )
+            await conn.commit()
+        save_db()
+        context.user_data.pop("admin_mode", None)
+        context.user_data.pop("links_new_title", None)
+        await update.message.reply_text("✅ تم إضافة اللينك.", reply_markup=admin_panel_keyboard())
+        return
+
+    if mode == "broadcast_text":
+        msg = text
+        async with await db_connect() as conn:
+            async with conn.execute("SELECT user_id FROM users") as cur:
+                users = [int(r["user_id"]) for r in await cur.fetchall()]
+
+        progress = await update.message.reply_text("⏳ جاري إرسال البرودكاست...", reply_markup=admin_panel_keyboard())
+
+        sent = 0
+        failed = 0
+
+        sem = asyncio.Semaphore(20)
+
+        async def _send_one(chat_id: int) -> None:
+            nonlocal sent, failed
+            async with sem:
+                for attempt in range(4):
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=msg)
+                        sent += 1
+                        return
+                    except RetryAfter as e:
+                        await asyncio.sleep(float(getattr(e, "retry_after", 1.5)) + 0.2)
+                    except (TimedOut, NetworkError):
+                        await asyncio.sleep(0.6 * (attempt + 1))
+                    except Exception:
+                        failed += 1
+                        return
+
+        batch_size = 200
+        for i in range(0, len(users), batch_size):
+            batch = users[i : i + batch_size]
+            await asyncio.gather(*[_send_one(uid) for uid in batch])
+            try:
+                await progress.edit_text(
+                    f"📢 Broadcast progress\n📨 Sent: {sent}\n⚠️ Failed: {failed}\n👥 Total: {len(users)}"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)
+
         await update.message.reply_text(
-            f"🔍 نتائج البحث ({len(res)}):",
-            reply_markup=InlineKeyboardMarkup(kb),
+            f"✅ Broadcast done.\n📨 Sent: {sent}\n⚠️ Failed: {failed}\n👥 Total: {len(users)}",
+            reply_markup=admin_panel_keyboard(),
         )
+        context.user_data.pop("admin_mode", None)
         return
-    if not check_rate_limit(uid):
-        await update.message.reply_text(RATE_LIMIT_MESSAGE)
+
+    if mode == "admins_add_user_id":
+        try:
+            new_id = int(re.sub(r"\\D+", "", text))
+        except Exception:
+            await update.message.reply_text("⚠️ اكتب رقم User ID صحيح.")
+            return
+        if new_id == MAIN_ADMIN_ID:
+            await update.message.reply_text("✅ الأدمن الرئيسي موجود بالفعل.", reply_markup=admin_panel_keyboard())
+            context.user_data.pop("admin_mode", None)
+            return
+        async with await db_connect() as conn:
+            await conn.execute("INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (new_id,))
+            await conn.commit()
+        save_db()
+        context.user_data.pop("admin_mode", None)
+        await update.message.reply_text("✅ تم إضافة الأدمن.", reply_markup=admin_panel_keyboard())
+        return
+
+    if mode == "user_search":
+        q = text.strip().lstrip("@")
+        if not q:
+            return
+        async with await db_connect() as conn:
+            if q.isdigit():
+                async with conn.execute(
+                    "SELECT user_id, username, first_name, last_name FROM users WHERE user_id=?",
+                    (int(q),),
+                ) as cur:
+                    rows = await cur.fetchall()
+            else:
+                like = f"%{q}%"
+                async with conn.execute(
+                    """
+                    SELECT user_id, username, first_name, last_name
+                    FROM users
+                    WHERE COALESCE(username,'') LIKE ? COLLATE NOCASE
+                       OR COALESCE(first_name,'') LIKE ? COLLATE NOCASE
+                       OR COALESCE(last_name,'') LIKE ? COLLATE NOCASE
+                    LIMIT 20
+                    """,
+                    (like, like, like),
+                ) as cur:
+                    rows = await cur.fetchall()
+        if not rows:
+            await update.message.reply_text("🔎 لا توجد نتائج.", reply_markup=admin_panel_keyboard())
+        else:
+            lines = []
+            for r in rows:
+                lines.append(
+                    f"👤 {int(r['user_id'])} | @{r['username'] or '-'} | {r['first_name'] or ''} {r['last_name'] or ''}".strip()
+                )
+            await update.message.reply_text("🔎 نتائج البحث:\n" + "\n".join(lines), reply_markup=admin_panel_keyboard())
+        context.user_data.pop("admin_mode", None)
+        return
 
 
-async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not is_main_admin(update.effective_user.id):
-        return
-    args = context.args or []
-    if len(args) < 1:
-        await update.message.reply_text("استخدم: /remove_admin ثم رقم المستخدم")
-        return
+async def _admin_choose_subject_for_upload(query, page: int, cb_base: str) -> None:
+    PAGE_SIZE = 12
+    offset = page * PAGE_SIZE
+    loading_msg = None
     try:
-        t = int(args[0])
-    except ValueError:
+        if LIST_LOADING_EDIT:
+            loading_msg = await query.message.reply_text("⏳ جاري تحميل المواد...")
+    except Exception:
+        loading_msg = None
+    async with await db_connect() as conn:
+        async with conn.execute(
+            """
+            SELECT id, name
+            FROM subjects
+            ORDER BY COALESCE(manual_order, 999999999), created_at, id
+            LIMIT ? OFFSET ?
+            """,
+            (PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        if loading_msg:
+            try:
+                await loading_msg.edit_text("📌 لا توجد مواد بعد.")
+            except Exception:
+                await query.message.reply_text("📌 لا توجد مواد بعد.", reply_markup=admin_panel_keyboard())
+        else:
+            await query.message.reply_text("📌 لا توجد مواد بعد.", reply_markup=admin_panel_keyboard())
         return
-    if remove_admin_user(t):
-        await update.message.reply_text("✅ تم.")
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    buttons = [btn(f"📚 {r['name']}", f"{cb_base}:subject={int(r['id'])}") for r in rows]
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(pagination_row(base_cb=cb_base, page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(admin_nav_row())
+    if loading_msg:
+        try:
+            await loading_msg.edit_text("📚 اختر المادة:", reply_markup=markup(keyboard))
+        except Exception:
+            await query.message.reply_text("📚 اختر المادة:", reply_markup=markup(keyboard))
     else:
-        await update.message.reply_text("❌ لا يمكن.")
+        await query.message.reply_text("📚 اختر المادة:", reply_markup=markup(keyboard))
 
 
-# -----------------------------------------------------------------------------
-# Jobs
-# -----------------------------------------------------------------------------
+async def _admin_choose_subject_generic(query, page: int, cb_base: str) -> None:
+    await _admin_choose_subject_for_upload(query, page=page, cb_base=cb_base)
 
 
-async def job_auto_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _admin_choose_lecture(query, subject_id: int, page: int, cb_base: str) -> None:
+    PAGE_SIZE = 12
+    offset = page * PAGE_SIZE
+    loading_msg = None
     try:
-        admin_backup_timestamped()
-        await send_db_to_admins(context.bot)
-        optional_github_backup()
-        logger.info("Scheduled backup OK")
-    except Exception as e:
-        logger.warning("Scheduled backup: %s", e)
+        if LIST_LOADING_EDIT:
+            loading_msg = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
+    except Exception:
+        loading_msg = None
+    async with await db_connect() as conn:
+        async with conn.execute(
+            """
+            SELECT id, title
+            FROM lectures
+            WHERE subject_id=?
+            ORDER BY COALESCE(manual_order, 999999999), created_at, id
+            LIMIT ? OFFSET ?
+            """,
+            (subject_id, PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        if loading_msg:
+            try:
+                await loading_msg.edit_text("📌 لا توجد محاضرات.")
+            except Exception:
+                await query.message.reply_text("📌 لا توجد محاضرات.", reply_markup=admin_panel_keyboard())
+        else:
+            await query.message.reply_text("📌 لا توجد محاضرات.", reply_markup=admin_panel_keyboard())
+        return
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    buttons = [btn(f"📄 {r['title']}", f"{cb_base.replace('_list', '_pick')}:id={int(r['id'])}") for r in rows]
+    # cb_base like "a:delete_lecture_list:s=123"
+    keyboard.extend(grid_2col(buttons))
+    keyboard.append(pagination_row(base_cb=cb_base, page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(admin_nav_row())
+    if loading_msg:
+        try:
+            await loading_msg.edit_text("📄 اختر المحاضرة:", reply_markup=markup(keyboard))
+        except Exception:
+            await query.message.reply_text("📄 اختر المحاضرة:", reply_markup=markup(keyboard))
+    else:
+        await query.message.reply_text("📄 اختر المحاضرة:", reply_markup=markup(keyboard))
 
 
-async def post_init(application: Application) -> None:
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start", "القائمة الرئيسية"),
-            BotCommand("subjects", "عرض المواد"),
-            BotCommand("search", "بحث عن محاضرة"),
-            BotCommand("help", "مساعدة"),
-            BotCommand("admin", "لوحة المشرف"),
-        ]
-    )
+async def _admin_show_links_manage(query, page: int) -> None:
+    PAGE_SIZE = 10
+    offset = page * PAGE_SIZE
+    loading_msg = None
     try:
-        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-    except Exception as e:
-        logger.warning("menu button: %s", e)
-    jq = application.job_queue
-    if jq:
-        jq.run_repeating(
-            job_auto_backup,
-            interval=timedelta(hours=AUTO_BACKUP_HOURS),
-            first=timedelta(seconds=30),
-            name="auto_backup",
+        if LIST_LOADING_EDIT:
+            loading_msg = await query.message.reply_text("⏳ جاري تحميل الروابط...")
+    except Exception:
+        loading_msg = None
+    async with await db_connect() as conn:
+        async with conn.execute(
+            """
+            SELECT id, title, url
+            FROM important_links
+            ORDER BY position, id
+            LIMIT ? OFFSET ?
+            """,
+            (PAGE_SIZE + 1, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        text = "🔗 Manage links\nلا توجد لينكات بعد."
+        if loading_msg:
+            try:
+                await loading_msg.edit_text(text, reply_markup=markup([[btn("➕ إضافة لينك", "a:links_add")], admin_nav_row()]))
+            except Exception:
+                await query.message.reply_text(
+                    text,
+                    reply_markup=markup([[btn("➕ إضافة لينك", "a:links_add")], admin_nav_row()]),
+                )
+        else:
+            await query.message.reply_text(
+                text,
+                reply_markup=markup([[btn("➕ إضافة لينك", "a:links_add")], admin_nav_row()]),
+            )
+        return
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    keyboard.append([btn("➕ إضافة لينك", "a:links_add")])
+    keyboard.append([btn("↕️ تفعيل الترتيب اليدوي", "a:links_reorder_init")])
+    for r in rows:
+        link_id = int(r["id"])
+        keyboard.append(
+            [
+                btn("⬆️", f"a:links_move:id={link_id}:dir=up:p={page}"),
+                url_btn(f"🔗 {r['title']}", r["url"]),
+                btn("⬇️", f"a:links_move:id={link_id}:dir=down:p={page}"),
+            ]
         )
+        keyboard.append([btn("🗑️ حذف", f"a:links_del:id={link_id}")])
+    keyboard.append(pagination_row(base_cb="a:manage_links", page=page, has_prev=page > 0, has_next=has_next))
+    keyboard.append(admin_nav_row())
+    if loading_msg:
+        try:
+            await loading_msg.edit_text("🔗 Manage links:", reply_markup=markup(keyboard))
+        except Exception:
+            await query.message.reply_text("🔗 Manage links:", reply_markup=markup(keyboard))
     else:
-        logger.warning("JobQueue unavailable — install: pip install 'python-telegram-bot[job-queue]'")
+        await query.message.reply_text("🔗 Manage links:", reply_markup=markup(keyboard))
+
+
+async def _ensure_links_positions() -> None:
+    async with await db_connect() as conn:
+        async with conn.execute(
+            "SELECT id FROM important_links ORDER BY position, id"
+        ) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            return
+        # Normalize positions to 1..n
+        for i, r in enumerate(rows, start=1):
+            await conn.execute("UPDATE important_links SET position=? WHERE id=?", (i, int(r["id"])))
+        await conn.commit()
+
+
+async def _swap_link_position(link_id: int, direction: str) -> None:
+    await _ensure_links_positions()
+    async with await db_connect() as conn:
+        async with conn.execute(
+            "SELECT id, position FROM important_links ORDER BY position, id"
+        ) as cur:
+            rows = await cur.fetchall()
+        ids = [int(r["id"]) for r in rows]
+        if link_id not in ids:
+            return
+        idx = ids.index(link_id)
+        if direction == "up" and idx == 0:
+            return
+        if direction == "down" and idx == len(ids) - 1:
+            return
+        swap_idx = idx - 1 if direction == "up" else idx + 1
+        a_id = ids[idx]
+        b_id = ids[swap_idx]
+        a_pos = int(rows[idx]["position"] or idx + 1)
+        b_pos = int(rows[swap_idx]["position"] or swap_idx + 1)
+        await conn.execute("BEGIN")
+        await conn.execute("UPDATE important_links SET position=? WHERE id=?", (b_pos, a_id))
+        await conn.execute("UPDATE important_links SET position=? WHERE id=?", (a_pos, b_id))
+        await conn.commit()
+
+
+async def _admin_show_admins(query) -> None:
+    async with await db_connect() as conn:
+        async with conn.execute("SELECT user_id FROM admins ORDER BY user_id") as cur:
+            rows = await cur.fetchall()
+    buttons: list[list[InlineKeyboardButton]] = []
+    buttons.append([btn("➕ إضافة أدمن", "a:admins_add"), btn("🔎 بحث مستخدمين", "a:user_search")])
+    buttons.append([btn(f"👑 MAIN: {MAIN_ADMIN_ID}", "noop")])
+    for r in rows:
+        uid = int(r["user_id"])
+        buttons.append([btn(f"👮 {uid}", "noop"), btn("🗑️", f"a:admins_del:id={uid}")])
+    buttons.append(admin_nav_row())
+    await query.message.reply_text("👮 Manage admins:", reply_markup=markup(buttons))
+
+
+def _split_filename(name: str) -> tuple[str, str]:
+    name = (name or "").strip()
+    if not name:
+        return ("ملف", "")
+    if "." not in name:
+        return (name, "")
+    base, ext = name.rsplit(".", 1)
+    return (base, "." + ext)
+
+
+async def _dedupe_lecture_title(subject_id: int, title: str) -> str:
+    base, ext = _split_filename(title)
+    candidate = f"{base}{ext}"
+    async with await db_connect() as conn:
+        async with conn.execute(
+            "SELECT 1 FROM lectures WHERE subject_id=? AND title=?",
+            (subject_id, candidate),
+        ) as cur:
+            exists = await cur.fetchone()
+        if not exists:
+            return candidate
+        i = 2
+        while True:
+            candidate = f"{base} ({i}){ext}"
+            async with conn.execute(
+                "SELECT 1 FROM lectures WHERE subject_id=? AND title=?",
+                (subject_id, candidate),
+            ) as cur2:
+                exists2 = await cur2.fetchone()
+            if not exists2:
+                return candidate
+            i += 1
+
+
+async def admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    if not await is_admin(uid):
+        return
+    session = get_upload_session(context)
+    if not session or not session.subject_id:
+        # If admin is uploading but session expired, guide them
+        if update.message and context.user_data.get("admin_mode") == "uploading":
+            await update.message.reply_text("⌛ انتهت جلسة الرفع. افتح الأمر مرة أخرى من لوحة الأدمن.")
+            context.user_data.pop("admin_mode", None)
+        return
+    session.last_activity = int(time.time())
+
+    doc = update.message.document
+    if not doc:
+        return
+    file_id = doc.file_id
+    raw_title = (doc.file_name or "ملف").strip()
+
+    # Progress counters per upload session/admin
+    counters = context.user_data.setdefault("upload_counters", {"saved": 0, "failed": 0, "last_notice": 0.0})
+    if not isinstance(counters, dict):
+        counters = {"saved": 0, "failed": 0, "last_notice": 0.0}
+        context.user_data["upload_counters"] = counters
+
+    now = int(time.time())
+    async with await db_connect() as conn:
+        try:
+            # De-dupe title within the same transaction/connection
+            base, ext = _split_filename(raw_title)
+            title = f"{base}{ext}"
+            async with conn.execute(
+                "SELECT 1 FROM lectures WHERE subject_id=? AND title=?",
+                (session.subject_id, title),
+            ) as cur0:
+                if await cur0.fetchone():
+                    i = 2
+                    while True:
+                        cand = f"{base} ({i}){ext}"
+                        async with conn.execute(
+                            "SELECT 1 FROM lectures WHERE subject_id=? AND title=?",
+                            (session.subject_id, cand),
+                        ) as cur1:
+                            if not await cur1.fetchone():
+                                title = cand
+                                break
+                        i += 1
+
+            cur = await conn.execute(
+                "INSERT INTO lectures(subject_id, title, file_id, created_at) VALUES(?,?,?,?)",
+                (session.subject_id, title, file_id, now),
+            )
+            lecture_id = int(cur.lastrowid)
+            await conn.execute(
+                "INSERT INTO uploads(admin_id, lecture_id, created_at) VALUES(?,?,?)",
+                (uid, lecture_id, now),
+            )
+            await conn.commit()
+        except Exception:
+            counters["failed"] = int(counters.get("failed", 0)) + 1
+            await update.message.reply_text("⚠️ حصل خطأ أثناء حفظ الملف، حاول مرة أخرى.")
+            return
+
+    counters["saved"] = int(counters.get("saved", 0)) + 1
+    save_db()
+
+    # Single progress message (edited), no spam per file
+    now_ts = time.time()
+    should_edit = (now_ts - float(session.last_progress_edit_ts or 0.0)) >= UPLOAD_PROGRESS_EDIT_EVERY_S
+    if should_edit and session.progress_chat_id and session.progress_message_id:
+        session.last_progress_edit_ts = now_ts
+        try:
+            await context.bot.edit_message_text(
+                chat_id=session.progress_chat_id,
+                message_id=session.progress_message_id,
+                text=(
+                    "📦 جاري الرفع...\n"
+                    f"✅ Saved: {int(counters.get('saved', 0))}\n"
+                    f"⚠️ Failed: {int(counters.get('failed', 0))}\n\n"
+                    "📤 ارفع المزيد من الملفات، أو اضغط ✅ تم."
+                ),
+                reply_markup=markup([[btn("✅ تم", "a:upload_done")], admin_nav_row()]),
+            )
+        except Exception:
+            pass
+
+
+# =======================
+# GLOBAL / MAINTENANCE + NOOP + ERRORS
+
+
+async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.callback_query:
+        await update.callback_query.answer()
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    LOG.exception("Unhandled error", exc_info=context.error)
+
+
+async def maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # This is a handler group guard via MessageHandler/CallbackQueryHandler is complex in PTB,
+    # so we enforce in main entrypoints for now. (Will be hardened in security todo.)
+    return
+
+
+async def _job_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_db()
+
+
+# =======================
+# APP BOOTSTRAP
+
+
+def build_app() -> Application:
+    logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    app = Application.builder().token(TOKEN).build()
+    app.bot_data["limiter"] = RateLimiter()
+
+    async def _post_init(application: Application) -> None:
+        await init_db()
+        application.job_queue.run_repeating(_job_backup, interval=60 * 30, first=60 * 5)
+
+    app.post_init = _post_init  # type: ignore[attr-defined]
+
+    app.add_error_handler(error_handler)
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
+
+    app.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
+    app.add_handler(CallbackQueryHandler(user_callbacks, pattern=r"^(u:|nav:)"))
+    app.add_handler(CallbackQueryHandler(admin_callbacks, pattern=r"^a:"))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, user_text))
+    app.add_handler(MessageHandler(filters.Document.ALL, admin_document))
+
+    return app
 
 
 def main() -> None:
-    if not TOKEN:
-        raise SystemExit("Set TOKEN environment variable.")
-
-    init_db()
-
-    builder = Application.builder().token(TOKEN).post_init(post_init)
-    try:
-        builder = builder.rate_limiter(AIORateLimiter())
-    except Exception as e:
-        logger.warning("AIORateLimiter: %s", e)
-    application = builder.build()
-
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("subjects", cmd_subjects))
-    application.add_handler(CommandHandler("search", cmd_search))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("admin", cmd_admin))
-    application.add_handler(CommandHandler("remove_admin", remove_admin_command))
-
-    application.add_handler(
-        CallbackQueryHandler(admin_callback_router, pattern=r"^adm_"),
-        group=0,
-    )
-    application.add_handler(
-        CallbackQueryHandler(user_callback_router, pattern=r"^u_"),
-        group=0,
-    )
-
-    # Broadcast copies any message — must run before other admin handlers
-    application.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE
-            & ~filters.COMMAND
-            & ~filters.StatusUpdate.ALL,
-            admin_broadcast_entry,
-        ),
-        group=0,
-    )
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_handle_text),
-        group=1,
-    )
-    application.add_handler(
-        MessageHandler(filters.Document.ALL, admin_handle_any_file),
-        group=1,
-    )
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_public_text),
-        group=2,
-    )
-
-    logger.info("Starting polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("Bot running...")
+    app = build_app()
+    app.run_polling()
 
 
 if __name__ == "__main__":

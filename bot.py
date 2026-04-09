@@ -2200,10 +2200,13 @@ if __name__ == "__main__":
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
         application.add_handler(MessageHandler(filters.Document.ALL, admin_document))
 
-        await init_db()
+        async def _post_init(app: Application) -> None:
+            # DB init is triggered during startup lifecycle
+            await init_db()
+            # schedule backups after startup
+            app.job_queue.run_repeating(_job_backup, interval=60 * 30, first=60 * 5)
 
-        # schedule backups
-        application.job_queue.run_repeating(_job_backup, interval=60 * 30, first=60 * 5)
+        application.post_init = _post_init  # type: ignore[attr-defined]
 
         print("BOT STARTED")
         LOG.info("Starting polling...")

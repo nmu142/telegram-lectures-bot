@@ -2145,6 +2145,31 @@ async def _job_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
     save_db()
 
 
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Single TEXT handler to avoid PTB short-circuiting between admin_text/user_text.
+    if not update.message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+
+    limiter: RateLimiter = context.application.bot_data["limiter"]
+    if not limiter.check(uid):
+        await update.message.reply_text(RATE_LIMIT_MESSAGE)
+        return
+
+    if not BOT_ENABLED and not await is_admin(uid):
+        await update.message.reply_text(MAINTENANCE_MESSAGE)
+        return
+
+    # Cleanup possible expired sessions (no-op if none)
+    cleanup_expired_upload_session(context)
+
+    if await is_admin(uid) and context.user_data.get("admin_mode"):
+        await admin_text(update, context)
+        return
+
+    await user_text(update, context)
+
+
 # =======================
 # APP BOOTSTRAP
 
@@ -2170,18 +2195,18 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(user_callbacks, pattern=r"^(u:|nav:)"))
     app.add_handler(CallbackQueryHandler(admin_callbacks, pattern=r"^a:"))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, user_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_handler(MessageHandler(filters.Document.ALL, admin_document))
 
     return app
 
 
-def main() -> None:
-    print("Bot running...")
-    app = build_app()
-    app.run_polling()
-
-
 if __name__ == "__main__":
-    main()
+    try:
+        application = build_app()
+        LOG.info("Starting polling...")
+        application.run_polling()
+    except Exception:
+        logging.basicConfig(level=LOG_LEVEL)
+        LOG.exception("Startup failed")
+        raise

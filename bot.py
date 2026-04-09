@@ -1855,7 +1855,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text("✅ الأدمن الرئيسي موجود بالفعل.", reply_markup=admin_panel_keyboard())
             context.user_data.pop("admin_mode", None)
             return
-        async with await db_connect() as conn:
+        async with db_conn() as conn:
             await _db_execute_with_retry(conn, "INSERT OR IGNORE INTO admins(user_id) VALUES(?)", (new_id,))
             await conn.commit()
         save_db()
@@ -1867,7 +1867,7 @@ async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         q = text.strip().lstrip("@")
         if not q:
             return
-        async with await db_connect() as conn:
+        async with db_conn() as conn:
             if q.isdigit():
                 async with conn.execute(
                     "SELECT user_id, username, first_name, last_name FROM users WHERE user_id=?",
@@ -1910,7 +1910,7 @@ async def _admin_choose_subject_for_upload(query, page: int, cb_base: str) -> No
             loading_msg = await query.message.reply_text("⏳ جاري تحميل المواد...")
     except Exception:
         loading_msg = None
-    async with await db_connect() as conn:
+    async with db_conn() as conn:
         async with conn.execute(
             """
             SELECT id, name
@@ -1959,7 +1959,7 @@ async def _admin_choose_lecture(query, subject_id: int, page: int, cb_base: str)
             loading_msg = await query.message.reply_text("⏳ جاري تحميل المحاضرات...")
     except Exception:
         loading_msg = None
-    async with await db_connect() as conn:
+    async with db_conn() as conn:
         async with conn.execute(
             """
             SELECT id, title

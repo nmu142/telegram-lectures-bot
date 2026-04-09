@@ -1,0 +1,30 @@
+# env
+.env
+.env.*
+
+# database
+*.db
+*.sqlite3
+lectures.db
+backup.db
+
+# cache
+__pycache__/
+*.pyc
+*.pyo
+
+# logs
+*.log
+admin_log.txt
+
+# venv
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# system
+.DS_Store
+Thumbs.db

@@ -231,7 +231,41 @@ async def db_connect() -> aiosqlite.Connection:
 
     conn2 = await aiosqlite.connect(DB_FILE, timeout=max(1.0, DB_BUSY_TIMEOUT_MS / 1000.0))
     await _setup(conn2)
-    return conn2
+    if await _quick_ok(conn2):
+        return conn2
+
+    # If backup is also corrupted, self-heal by creating a new DB file.
+    try:
+        await conn2.close()
+    except Exception:
+        pass
+
+    try:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        corrupt_path = f"{DB_FILE}.corrupt-{ts}"
+        try:
+            if os.path.exists(DB_FILE):
+                shutil.copy(DB_FILE, corrupt_path)
+        except Exception:
+            pass
+        for suffix in ("-wal", "-shm"):
+            try:
+                p = DB_FILE + suffix
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        try:
+            if os.path.exists(DB_FILE):
+                os.remove(DB_FILE)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    conn3 = await aiosqlite.connect(DB_FILE, timeout=max(1.0, DB_BUSY_TIMEOUT_MS / 1000.0))
+    await _setup(conn3)
+    return conn3
 
 
 def _is_db_locked_error(err: Exception) -> bool:
